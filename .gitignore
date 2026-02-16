@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Pixi
+.pixi/
+pixi.lock
+
+# Caches
+.cache/
+
+# Runs (logs, results, caches)
+runs/
+eval_results/
+lm_eval_requests_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

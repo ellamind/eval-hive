@@ -1,0 +1,109 @@
+# === Placeholder variables ===
+# substituted at runtime:
+#   ${EH_PORT}        — dynamically assigned port (random 30000-59999)
+#   ${EH_MODEL_PATH}  — resolved model path (local path or HF cache path)
+
+# === SLURM Configuration ===
+# Consult your cluster's documentation if you are unsure about the values below.
+job_name: "hplt2c-ref-eval"
+partition: "boost_usr_prod"
+account: "oellm_prod2026"
+# qos: "normal"
+qos: "boost_qos_dbg"
+cpus_per_node: 32 
+gres_per_node: "gpu:4"
+# time_limit: "23:58:00"
+time_limit: "29:00"
+
+max_concurrent_jobs: 1
+
+# Additional SBATCH arguments (optional)
+additional_sbatch_args:
+# exclude: "node[001-010]"  # Exclude specific nodes
+
+# === Scaling Configuration ===
+# The total number of nodes will be num_inference_servers * num_nodes_per_inference_server.
+num_inference_servers: 4
+num_nodes_per_inference_server: 1 # Increase this only if your model requires more than 1 node per inference server.
+parallel_tasks: 8  # Max concurrent lm-eval processes per job (one per task). Requires 'prepare' to be run first. 1 = sequential.
+
+# === Environment Configuration ===
+# Option 1: Use pixi (set pixi_manifest and pixi_env)
+pixi_manifest: "pixi.toml"  # Path to the pixi manifest file. Edit only if you want to use one of the pre-installed environments (see README.md).
+pixi_env: "default"  # Name of the pixi environment to use (see README.md).
+# Option 2: Use a custom activation command (clear pixi_manifest and pixi_env above, set env_activation_command)
+env_activation_command:  # Custom command to activate the environment, e.g. "source ./activate.sh"
+env_vars:
+  HF_HUB_OFFLINE: "1" # you should download data and model beforehand
+
+# === Inference Server Configuration ===
+# Port is dynamically set by inference-hive using $EH_PORT (random port 30000-59999)
+# This avoids port collisions when multiple shards run on the same node.
+# 
+# Model path is dynamically set by inference-hive using $EH_MODEL_PATH (local path or HF cache path)
+inference_server_command: >-
+  singularity exec --nv
+  --env HF_HUB_OFFLINE=1
+  --home $SCRATCH/tmp_home
+  --bind $SCRATCH/tmp_home/container_tmp:/tmp
+  --bind ${EH_MODEL_PATH}:${EH_MODEL_PATH}
+  /leonardo_work/AIFAC_L01_028/midahl00/base-eval-suite/containers/vllm/vllm-openai_v0.14.1.sif
+  vllm serve ${EH_MODEL_PATH}
+      --host 0.0.0.0
+      --port ${EH_PORT}
+      --tensor-parallel-size 4
+      --max-num-seqs 512
+      --max-model-len auto
+      --enable-chunked-prefill
+      --enable-prefix-caching
+      --gpu-memory-utilization 0.6
+
+# === Health Check Configuration ===
+# max_wait_minutes is the maximum time to wait for the API server to become healthy.
+# make sure it is reasonable for loading the model. larger models will take longer.
+health_check_max_wait_minutes: 10  # Maximum time to wait for API server to become healthy.
+health_check_interval_seconds: 20  # Interval between health check attempts
+
+# === Eval Configuration ===
+eval:
+  eval_suite_path: "/leonardo_work/AIFAC_L01_028/midahl00/base-eval-suite" # path to the eval suite directory
+  suites_and_tasks:
+    - eng_base_easy
+    - deu_base_easy
+  # --model_args: joined as key=value,key=value
+  model_args:
+    model: ${EH_MODEL_PATH}
+    tokenizer: ${EH_MODEL_PATH}
+    base_url: http://localhost:${EH_PORT}/v1/completions
+    num_concurrent: 4
+    max_length: 2048
+  # HTTP timeout and retries for lm-eval API requests.
+  # Injected into model_args unless already set there.
+  timeout: 600        # seconds (default: 600)
+  max_retries: 5      # attempts (default: 5)
+  # All other lm_eval CLI flags, passed through as --key value
+  lm_eval_args:
+    model: local-completions
+    batch_size: 16
+    log_samples: true
+
+# === Output Configuration ===
+output_path: "eval_results/hplt2c_deu"
+request_cache_dir: "lm_eval_requests_cache"  # optional: shared request cache for lm-eval (LM_HARNESS_CACHE_PATH)
+
+models:
+  HPLT2c_deu:
+    path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_deu_checkpoints/main"
+
+  HPLT2c_deu_checkpoints:
+    path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_deu_checkpoints"
+    checkpoint_pattern: "checkpoint_{step}"
+    steps: [5000, 10000, 20000, 30000, 40000]
+
+  HPLT2c_eng:
+    path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_eng_checkpoints/main"
+
+  HPLT2c_eng_checkpoints:
+    path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_eng_checkpoints"
+    checkpoint_pattern: "checkpoint_{step}"
+    steps: [5000, 10000, 20000, 30000, 40000]

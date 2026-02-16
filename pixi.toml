@@ -1,0 +1,22 @@
+[workspace]
+name = "eval-hive"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[dependencies]
+python = ">=3.12,<3.14"
+
+[tasks]
+eval-hive = "python -m eval_hive"
+
+[pypi-dependencies]
+pydantic = ">=2.12.5, <3"
+pyyaml = ">=6.0, <7"
+loguru = ">=0.7, <1"
+tabulate = ">=0.9, <1"
+tqdm = ">=4.60, <5"
+aiohttp = ">=3.9, <4"
+transformers = ">=5.0.0, <6"
+hf-transfer = ">=0.1, <1"
+lm-eval = {git = "https://github.com/EleutherAI/lm-evaluation-harness", branch = "main", extras = ["api", "math", "multilingual"]}
