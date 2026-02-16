@@ -19,4 +19,6 @@ tqdm = ">=4.60, <5"
 aiohttp = ">=3.9, <4"
 transformers = ">=5.0.0, <6"
 hf-transfer = ">=0.1, <1"
+polars = ">=1.0, <2"
+huggingface-hub = ">=1.3, <2"
 lm-eval = {git = "https://github.com/EleutherAI/lm-evaluation-harness", branch = "main", extras = ["api", "math", "multilingual"]}

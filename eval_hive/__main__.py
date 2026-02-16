@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-from eval_hive import cancel, create_run, prepare, status, submit, validate_config
+from eval_hive import cancel, collect, create_run, prepare, status, submit, validate_config
 
 COMMANDS = {
     "validate-config": (validate_config, "Validate a configuration file"),
@@ -10,6 +10,7 @@ COMMANDS = {
     "submit": (submit, "Submit jobs from a run directory"),
     "status": (status, "Show progress of a run"),
     "cancel": (cancel, "Cancel all active jobs for a run"),
+    "collect": (collect, "Collect results from a run into scores.parquet"),
 }
 
 

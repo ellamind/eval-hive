@@ -1,4 +1,5 @@
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -7,6 +8,16 @@ from tabulate import tabulate
 
 from eval_hive.config import load_config
 from eval_hive.create_run import manifest_key
+
+
+def _fmt_tokens(n: int | None) -> str:
+    """Format a token count for display, e.g. 100_000_000_000 → '100B'."""
+    if n is None:
+        return "-"
+    for suffix, divisor in [("T", 10**12), ("B", 10**9), ("M", 10**6)]:
+        if n >= divisor:
+            return f"{n / divisor:g}{suffix}"
+    return f"{n:,}"
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -35,23 +46,35 @@ def run(args: argparse.Namespace) -> int:
 
     # Build model/checkpoint table
     rows = []
-    for model_key, entry in config.models.items():
+    for config_key, entry in config.models.items():
+        effective_model_key = entry.model_key or config_key
+        is_checkpoint = entry.checkpoint_pattern is not None
+        display = entry.display_name
         model_paths = entry.resolve_model_paths()
         for label, path in model_paths:
             exists = path.is_dir() or path.is_file()
-            key = manifest_key(model_key, label)
+            key = manifest_key(effective_model_key, label)
+            step = None
+            if is_checkpoint:
+                matches = re.findall(r"\d+", label)
+                step = int(matches[-1]) if matches else None
+            tokens = entry.tokens_trained
+            if tokens is None and entry.train_batch_size is not None and step is not None:
+                tokens = entry.train_batch_size * step
             rows.append([
                 key,
-                model_key,
+                display,
                 label,
                 str(path),
                 "yes" if exists else "NO",
+                entry.train_batch_size or "-",
+                _fmt_tokens(tokens),
             ])
 
     print()
     print(tabulate(
         rows,
-        headers=["Manifest Key", "Model", "Checkpoint", "Path", "Exists"],
+        headers=["Manifest Key", "Display Name", "Checkpoint", "Path", "Exists", "Batch Size", "Tokens Trained"],
         tablefmt="rounded_outline",
     ))
     print()

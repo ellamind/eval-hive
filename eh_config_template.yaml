@@ -91,10 +91,16 @@ output_path: ""
 request_cache_dir: "lm_eval_requests_cache"  # optional: shared request cache for lm-eval (LM_HARNESS_CACHE_PATH)
 
 models:
-  HPLT2c_eng:
+  HPLT2c_eng_main:  # unique config key (YAML dict keys must be unique)
+    model_key: HPLT2c_eng  # shared model key → parquet 'model' column (defaults to config key if omitted)
     path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_eng_checkpoints/main"
+    display_name: "HPLT2c eng"  # human-friendly name for result display (required)
+    tokens_trained: 100B  # total tokens trained (recommended for non-checkpoint models; supports K, M, B, T suffixes)
 
-  HPLT2c_eng_checkpoints:
+  HPLT2c_eng_checkpoints:  # unique config key
+    model_key: HPLT2c_eng  # same model key → same 'model' column, differentiated by step
     path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_eng_checkpoints"
     checkpoint_pattern: "checkpoint_{step}"
     steps: [5000, 10000, 20000, 30000, 40000]
+    display_name: "HPLT2c eng"  # human-friendly name for result display (required)
+    train_batch_size: 4_194_304  # batch size in tokens (recommended for checkpoint models)

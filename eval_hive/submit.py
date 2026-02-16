@@ -5,6 +5,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
+import polars as pl
 from loguru import logger
 
 from eval_hive.config import load_config
@@ -72,7 +73,76 @@ def get_active_jobs(job_name: str) -> list[dict]:
     return active
 
 
-def get_tasks_to_submit(manifest: dict, run_dir: Path, job_name: str) -> list[str]:
+def _load_scores_parquet(source: str) -> pl.DataFrame | None:
+    """Load a scores parquet from a local path or HF repo.
+
+    If *source* points to an existing local file, reads it directly.
+    Otherwise treats it as a HuggingFace dataset repo ID.
+    """
+    if Path(source).is_file():
+        logger.info(f"Loading local parquet: {source}")
+        return pl.read_parquet(source)
+
+    from eval_hive.results.hf import download_hf_parquet
+
+    return download_hf_parquet(source)
+
+
+def get_hf_covered_keys(
+    source: str,
+    manifest: dict[str, dict],
+    task_map: dict[str, list[str]],
+    suites: list[str],
+) -> set[str]:
+    """Determine which manifest keys have all their tasks covered in existing data.
+
+    *source* can be a local parquet path or a HuggingFace dataset repo ID.
+    Downloads/reads the parquet once and checks each manifest key's expected
+    leaf tasks against the data.
+    """
+    from eval_hive.collect import parse_step_from_label
+
+    df = _load_scores_parquet(source)
+    if df is None or len(df) == 0:
+        logger.info("No existing score data available for dedup")
+        return set()
+
+    # Build lookup set of (model, step, task) tuples
+    hf_tuples: set[tuple[str, int | None, str]] = set()
+    for row in df.select("model", "step", "task").unique().iter_rows(named=True):
+        step = None if row["step"] is None else int(row["step"])
+        hf_tuples.add((row["model"], step, row["task"]))
+
+    logger.info(f"HF data: {len(hf_tuples)} unique (model, step, task) tuples")
+
+    # Collect all expected leaf tasks across all suites
+    all_expected_tasks: set[str] = set()
+    for suite in suites:
+        all_expected_tasks.update(task_map.get(suite, []))
+
+    covered_keys: set[str] = set()
+
+    for mkey, entry in manifest.items():
+        model_key = entry["model_key"]
+        label = entry["label"]
+        step = parse_step_from_label(label)
+
+        # Check if ALL expected leaf tasks are present for this (model, step)
+        if all((model_key, step, task) in hf_tuples for task in all_expected_tasks):
+            covered_keys.add(mkey)
+
+    if covered_keys:
+        logger.info(f"HF dedup: {len(covered_keys)} manifest keys fully covered")
+
+    return covered_keys
+
+
+def get_tasks_to_submit(
+    manifest: dict,
+    run_dir: Path,
+    job_name: str,
+    hf_covered: set[str] | None = None,
+) -> list[str]:
     """Determine which manifest keys still need submission."""
     all_keys = list(manifest.keys())
 
@@ -99,9 +169,15 @@ def get_tasks_to_submit(manifest: dict, run_dir: Path, job_name: str) -> list[st
 
     in_queue = {j["task_key"] for j in active}
 
+    # HF coverage (third filter layer)
+    if hf_covered:
+        logger.info(f"Tasks covered in HF dataset: {len(hf_covered)}")
+
     return [
         key for key in all_keys
-        if key not in completed and key not in in_queue
+        if key not in completed
+        and key not in in_queue
+        and (hf_covered is None or key not in hf_covered)
     ]
 
 
@@ -167,6 +243,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--max-retries", type=int, default=None,
         help="Maximum number of retry cycles (default: unlimited)",
     )
+    parser.add_argument(
+        "--check-hf", type=str, default=None,
+        metavar="SOURCE",
+        help="Skip manifest keys whose tasks are already covered. "
+             "SOURCE can be a local parquet file or a HuggingFace dataset repo ID.",
+    )
 
 
 def run(args: argparse.Namespace) -> int:
@@ -179,13 +261,34 @@ def run(args: argparse.Namespace) -> int:
         logger.error(f"Job script not found: {job_script}")
         return 1
 
+    # HF dedup: compute once before the retry loop
+    hf_covered: set[str] | None = None
+    if args.check_hf:
+        task_map_path = args.run_dir / "eh_task_map.json"
+        if task_map_path.exists():
+            task_map = json.loads(task_map_path.read_text())
+            hf_covered = get_hf_covered_keys(
+                args.check_hf,
+                manifest,
+                task_map,
+                config.eval.suites_and_tasks,
+            )
+        else:
+            logger.warning(
+                "Task map not found at %s. Skipping HF dedup. "
+                "Re-run create-run to generate it.",
+                task_map_path,
+            )
+
     retry_count = 0
 
     while True:
         if retry_count > 0:
             logger.info(f"=== Retry cycle {retry_count} ===")
 
-        tasks_to_submit = get_tasks_to_submit(manifest, args.run_dir, config.job_name)
+        tasks_to_submit = get_tasks_to_submit(
+            manifest, args.run_dir, config.job_name, hf_covered
+        )
         logger.info(f"Tasks to submit: {len(tasks_to_submit)}")
 
         if not tasks_to_submit:
@@ -209,7 +312,9 @@ def run(args: argparse.Namespace) -> int:
         if not remaining:
             logger.info(f"Done. Submitted {submitted} jobs.")
             if args.retry_interval:
-                tasks_to_submit = get_tasks_to_submit(manifest, args.run_dir, config.job_name)
+                tasks_to_submit = get_tasks_to_submit(
+                    manifest, args.run_dir, config.job_name, hf_covered
+                )
                 if not tasks_to_submit:
                     logger.info("All tasks submitted or in queue. Exiting.")
                     return 0

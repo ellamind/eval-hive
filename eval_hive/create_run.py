@@ -7,6 +7,7 @@ from pathlib import Path
 
 from loguru import logger
 
+from eval_hive.collect import parse_step_from_label
 from eval_hive.config import EhConfig, load_config
 
 
@@ -33,19 +34,29 @@ def build_manifest(config: EhConfig) -> dict[str, dict]:
     {"Model--main": {"model_key": "...", "label": "...", "model_path": "..."}, ...}
     """
     manifest = {}
-    for model_key, entry in config.models.items():
+    for config_key, entry in config.models.items():
+        effective_model_key = entry.model_key or config_key
         for label, path in entry.resolve_model_paths():
-            key = manifest_key(model_key, label)
+            key = manifest_key(effective_model_key, label)
             if key in manifest:
                 raise ValueError(
                     f"Duplicate manifest key '{key}' from "
-                    f"model_key='{model_key}', label='{label}'. "
+                    f"model_key='{effective_model_key}', label='{label}'. "
                     f"Ensure model_key + label combinations are unique."
                 )
+            tokens_trained = entry.tokens_trained
+            if tokens_trained is None and entry.train_batch_size is not None:
+                step = parse_step_from_label(label)
+                if step is not None:
+                    tokens_trained = entry.train_batch_size * step
+
             manifest[key] = {
-                "model_key": model_key,
+                "model_key": effective_model_key,
                 "label": label,
                 "model_path": str(path),
+                "display_name": entry.display_name,
+                "train_batch_size": entry.train_batch_size,
+                "tokens_trained": tokens_trained,
             }
     return manifest
 
@@ -939,6 +950,21 @@ def run(args: argparse.Namespace) -> int:
         server_lifecycle_block = SERVER_LIFECYCLE_BLOCK_SERVERLESS
         server_shutdown_block = ""
 
+    # Resolve suite/group names to leaf tasks and write task map into run directory.
+    # Always generated (used by collect --check-hf and status, not just parallel mode).
+    from lm_eval.tasks import TaskManager
+    from eval_hive.prepare import resolve_task_names
+
+    logger.info("Resolving task map...")
+    tm = TaskManager(include_path=config.eval.eval_suite_path)
+    task_map = {}
+    for suite_or_task in config.eval.suites_and_tasks:
+        task_map[suite_or_task] = resolve_task_names(tm, [suite_or_task])
+
+    task_map_dst = run_dir / "eh_task_map.json"
+    task_map_dst.write_text(json.dumps(task_map, indent=2))
+    logger.info(f"Task map written to: {task_map_dst}")
+
     # Eval loop block: parallel (per-task) or sequential (per-suite)
     eval_format_vars = {
         "lm_eval_extra_args": build_lm_eval_extra_args(config),
@@ -946,20 +972,6 @@ def run(args: argparse.Namespace) -> int:
         "include_path_arg": include_path_arg,
     }
     if config.parallel_tasks > 1:
-        # Resolve suite/group names to leaf tasks and write task map into run directory
-        from lm_eval.tasks import TaskManager
-        from eval_hive.prepare import resolve_task_names
-
-        logger.info("Resolving task map for parallel execution...")
-        tm = TaskManager(include_path=config.eval.eval_suite_path)
-        task_map = {}
-        for suite_or_task in config.eval.suites_and_tasks:
-            task_map[suite_or_task] = resolve_task_names(tm, [suite_or_task])
-
-        task_map_dst = run_dir / "eh_task_map.json"
-        task_map_dst.write_text(json.dumps(task_map, indent=2))
-        logger.info(f"Task map written to: {task_map_dst}")
-
         eval_loop_block = EVAL_LOOP_PARALLEL.format(
             parallel_tasks=config.parallel_tasks,
             **eval_format_vars,

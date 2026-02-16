@@ -12,7 +12,9 @@ eval-hive manages the full evaluation lifecycle. Configure models and eval suite
 - **Flexible server deployment** — single-node, multi-node, or multiple independent inference servers behind a built-in load balancer for high throughput eval.
 - **Parallel task execution** — run multiple lm-eval processes concurrently to keep GPUs busy.
 - **Request caching** — pre-build lm-eval request caches for fast, race-free distribution to compute nodes.
-- **Deduplication** — skips already-completed work at both submit time and runtime. Resubmit safely after partial failures.
+- **Result collection** — collect lm-eval results into a parquet file with automatic score aggregation for task groups and eval suites.
+- **HuggingFace sync** — optionally push results to a HF dataset repo, with merge and dedup. Skip already-covered jobs at submit time with `--check-hf`.
+- **Deduplication** — skips already-completed work at submit time, runtime, and optionally against a HF dataset. Resubmit safely after partial failures.
 - **Failure handling** — per-task resumability, SIGUSR1 graceful shutdown, idempotent resubmission.
 - **Pydantic config validation** — catches errors before any jobs are submitted.
 
@@ -48,6 +50,10 @@ pixi run eval-hive submit runs/my-run
 
 # 6. Monitor progress
 pixi run eval-hive status runs/my-run
+
+# 7. Collect results into parquet (with optional HF push)
+pixi run eval-hive collect runs/my-run
+pixi run eval-hive collect runs/my-run --push-to org/eval-scores
 ```
 
 ## Workflow
@@ -69,6 +75,14 @@ pixi run eval-hive status runs/my-run
                                     │  status  │
                                     │ monitor  │
                                     │ progress │
+                                    └────┬─────┘
+                                         │
+                                    ┌────┴─────┐
+                                    │ collect  │
+                                    │ parse +  │
+                                    │ aggregate│
+                                    │ → parquet│
+                                    │ (→ HF)   │
                                     └──────────┘
 ```
 
@@ -93,10 +107,16 @@ pixi run eval-hive submit runs/my-run
 pixi run eval-hive submit runs/my-run --dry                      # preview only
 pixi run eval-hive submit runs/my-run --limit 5                  # submit at most 5 jobs
 pixi run eval-hive submit runs/my-run --retry-interval 10        # retry every 10 min until all submitted
+pixi run eval-hive submit runs/my-run --check-hf org/eval-scores # skip jobs covered in HF dataset
 
 # Monitor progress
 pixi run eval-hive status runs/my-run
 pixi run eval-hive status runs/my-run --detailed                 # per-suite/task breakdown
+
+# Collect results into parquet
+pixi run eval-hive collect runs/my-run                           # writes scores.parquet
+pixi run eval-hive collect runs/my-run -o my_scores.parquet      # custom output path
+pixi run eval-hive collect runs/my-run --push-to org/eval-scores # merge + dedup + upload to HF
 
 # Cancel all active jobs for a run
 pixi run eval-hive cancel runs/my-run
@@ -113,8 +133,41 @@ Single YAML file per setup. Copy `eh_config_template.yaml` to get started. Model
 - **`inference_server_command` is a plain string with placeholders**, not a structured config. Supports any inference server backend (vLLM, sglang) and container wrapping (singularity, apptainer) without schema changes. Placeholders substituted at runtime: `${EH_PORT}`, `${EH_MODEL_PATH}`.
 - **`inference_server_command: null`** disables the server lifecycle entirely. Use this for lm-eval backends that load models directly (`hf`, `nemo`, etc.). The job skips server start/health-check/stop and runs `lm_eval` immediately.
 - **`eval.model_args`** dict is joined as `key=value,key=value` for `lm_eval --model_args`. **`eval.lm_eval_args`** is a passthrough dict — each key becomes a CLI flag (`--key value`). No schema changes needed when lm-eval adds new flags.
-- **Model entries are minimal** — just `path` and optional checkpoint info.
+- **Model entries carry metadata** — `path`, `display_name`, optional `model_key` override, checkpoint info, and training metadata (`train_batch_size` / `tokens_trained`). A model and its checkpoints can share the same `model_key` — they differ only by `step` in the parquet composite key `(model, step, task, metric, metric_filter)`.
 - **Pydantic validation** catches config errors before any jobs are submitted.
+
+### Model entries
+
+Each model entry under `models:` defines a model or checkpoint series to evaluate:
+
+```yaml
+models:
+  # Config dict keys must be unique but are only used internally.
+  # Use model_key to control the parquet 'model' column.
+  HPLT2c_eng_main:
+    model_key: HPLT2c_eng          # parquet 'model' column (defaults to config key)
+    path: "/path/to/model/main"
+    display_name: "HPLT2c eng"     # required: human-friendly name
+    tokens_trained: 100B           # recommended for non-checkpoint models (supports K, M, B, T)
+
+  HPLT2c_eng_checkpoints:
+    model_key: HPLT2c_eng          # same model_key → same model in parquet, different steps
+    path: "/path/to/model"
+    display_name: "HPLT2c eng"
+    checkpoint_pattern: "checkpoint_{step}"
+    steps: [5000, 10000, 20000]    # optional filter (default: discover all)
+    train_batch_size: 2_097_152    # recommended for checkpoints (tokens_trained = batch_size × step)
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `path` | yes | Local path or HuggingFace model ID |
+| `display_name` | yes | Human-friendly name for result display |
+| `model_key` | no | Parquet `model` column value. Defaults to config dict key. Set this to share a model key between a main model and its checkpoints. |
+| `checkpoint_pattern` | no | Pattern for checkpoint subdirectories, e.g. `checkpoint_{step}` |
+| `steps` | no | Filter to specific steps. Requires `checkpoint_pattern`. |
+| `train_batch_size` | no | Batch size in tokens. Recommended for checkpoints (`tokens_trained = train_batch_size × step`). |
+| `tokens_trained` | no | Total tokens trained. Supports human-readable suffixes: `100B`, `2T`, `500M`. Recommended for non-checkpoint models. |
 
 ## Prepare step
 
@@ -149,7 +202,7 @@ With `--workers N` (default 4), tasks are sharded across worker processes. Tasks
 The `create_run` step resolves the config into a concrete execution plan:
 
 1. **Loads config** and validates with Pydantic.
-2. **Builds manifest** — iterates all models, resolves checkpoint patterns, produces a flat list of `{model_key, label, model_path}` dicts. The list index is the Slurm array task ID.
+2. **Builds manifest** — iterates all models, resolves checkpoint patterns, produces a flat mapping of `{model_key, label, model_path, display_name, train_batch_size, tokens_trained}` dicts keyed by `{model_key}--{label}`. The `model_key` comes from the entry's `model_key` field (or the config dict key if not set).
 3. **Generates run directory** containing:
    - `eh_manifest.json` — the manifest (read by `jq` in the job script)
    - `eh_config.yaml` — frozen copy of the input config
@@ -289,9 +342,11 @@ fi
 
 ### Deduplication
 
-Two levels of deduplication, both filesystem-based.
+Three levels of deduplication.
 
-**Submit-time dedup** (`submit.py`): before submitting a job, checks `progress/jobs_completed.log` and skips array indices that are already marked complete.
+**Submit-time dedup** (`submit.py`): before submitting a job, checks `progress/jobs_completed.log` and the Slurm queue, skipping manifest keys that are already completed or active.
+
+**HF-based dedup** (`submit --check-hf`): optionally downloads a HF dataset parquet and skips manifest keys whose expected tasks are already fully covered. Useful for avoiding duplicate work across clusters sharing results via HuggingFace. Respects `HF_HUB_OFFLINE` for cached/offline access.
 
 **Runtime dedup** (inside each job): before running each suite or task, checks if `results_*.json` already exists in the output directory. Skips work that already has results, enabling partial resumption.
 
@@ -307,6 +362,25 @@ Results are written to deterministic paths:
 
 Completion tracking uses a simple append-only log (`progress/jobs_completed.log`). Each completed job appends its task ID. Failed jobs are tracked in `progress/jobs_failed.log` with reasons.
 
+### Collect and score aggregation
+
+The `collect` command parses lm-eval result JSON files from a run directory and produces a single parquet file.
+
+**Discovery**: walks `{output_path}/{model_key}/{label}/*/results_*.json` using the manifest to find all result files. For each manifest entry, the training step is extracted from the label (e.g. `checkpoint_0005000` → `5000`; `main` → `None`).
+
+**Parsing**: each result JSON is parsed into `ScoreRow` records capturing the score, metric, task metadata, language, formulation type, and subtask structure.
+
+**Aggregation**: after parsing leaf benchmark scores, group and suite scores are computed bottom-up from the YAML task hierarchy. For each group defined in the task YAMLs:
+
+1. The group's `aggregate_metric_list` specifies which metrics to aggregate and how.
+2. Children's scores are collected from leaf results or already-computed sub-group scores.
+3. The aggregate is computed as a simple mean, or weighted by `n_samples` when `weight_by_size: true`.
+4. A `subtask_tree` adjacency map tracks which tasks contribute to each group score.
+
+Groups reachable from the configured `suites_and_tasks` are tagged as `eval_suite`; intermediate groups as `task_group`.
+
+**HF push** (`--push-to`): downloads the existing parquet from a HuggingFace dataset repo, merges with local results, deduplicates on `(model, step, task, metric, metric_filter)` keeping the latest `eval_date`, and re-uploads. The local parquet is also updated with the merged result.
+
 ### Failure handling
 
 - **Per-suite/task resumability**: each suite (or individual task in parallel mode) completes independently. Failures in one don't affect others.
@@ -320,8 +394,8 @@ Generated by `create-run`:
 ```
 runs/my-run/
 ├── eh_config.yaml          # frozen copy of config
-├── eh_manifest.json        # task_key → (model_key, label, model_path)
-├── eh_task_map.json        # suite → [leaf_tasks] (parallel mode only)
+├── eh_manifest.json        # task_key → {model_key, label, model_path, display_name, ...}
+├── eh_task_map.json        # suite → [leaf_tasks] (used by collect + submit --check-hf)
 ├── eh_job.slurm            # generated sbatch script
 ├── logs/                   # {model}-{checkpoint}-{jobid}.log (start/finish per task only)
 └── progress/
@@ -340,10 +414,17 @@ eval-hive/
 │   ├── create_run.py        # Generate run directory, manifest, sbatch script
 │   ├── prepare.py           # Download datasets, build request caches, pack tarball
 │   ├── validate_config.py   # Validate config and display model/checkpoint table
-│   ├── submit.py            # Submit jobs from manifest with dedup
+│   ├── submit.py            # Submit jobs from manifest with dedup (+ --check-hf)
+│   ├── collect.py           # Collect results into parquet with aggregation (+ --push-to)
 │   ├── status.py            # Monitor run progress
 │   ├── cancel.py            # Cancel active Slurm jobs for a run
-│   └── load_balancer.py     # Async least-connections reverse proxy
+│   ├── load_balancer.py     # Async least-connections reverse proxy
+│   └── results/
+│       ├── __init__.py
+│       ├── schemas.py       # ScoreRow, EvalConfig, TaskConfig (Pydantic models)
+│       ├── parse.py         # Parse lm-eval result JSONs into ScoreRows
+│       ├── aggregate.py     # Compute group/suite scores from YAML hierarchy
+│       └── hf.py            # HuggingFace parquet download, upload, merge + dedup
 ├── eh_config_template.yaml  # Annotated config template
 ├── pixi.toml                # Environment definition
 └── README.md

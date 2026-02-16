@@ -5,10 +5,43 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, Dict, Any, List
 
 
+def _parse_human_int(value) -> int | None:
+    """Parse a human-readable integer with optional suffix.
+
+    Accepts plain integers or strings like ``"100B"``, ``"2T"``, ``"4M"``, ``"1.5B"``.
+
+    Supported suffixes (case-insensitive): K (10^3), M (10^6), B (10^9), T (10^12).
+    """
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if not isinstance(value, str):
+        raise ValueError(f"Expected int or string, got {type(value).__name__}")
+    s = value.strip().replace("_", "")
+    if not s:
+        return None
+    suffixes = {"K": 10**3, "M": 10**6, "B": 10**9, "T": 10**12}
+    upper = s[-1].upper()
+    if upper in suffixes:
+        return int(float(s[:-1]) * suffixes[upper])
+    return int(s)
+
+
 class ModelEntry(BaseModel):
     """A single model (or checkpoint family) to evaluate."""
 
     path: str = Field(..., description="Local path or HuggingFace model ID")
+    model_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "Model identifier used in the parquet 'model' column and output directory. "
+            "Defaults to the config dict key. Set this to share a model key between "
+            "a main model entry and its checkpoint entry (they differ only by step)."
+        ),
+    )
     checkpoint_pattern: Optional[str] = Field(
         default=None,
         description="Pattern for checkpoint subdirectories, e.g. 'checkpoint_{step}'",
@@ -20,6 +53,31 @@ class ModelEntry(BaseModel):
             "None means auto-discover all subdirectories matching checkpoint_pattern."
         ),
     )
+    display_name: str = Field(
+        ...,
+        description="Human-friendly model name for result display.",
+    )
+    train_batch_size: Optional[int] = Field(
+        default=None,
+        description=(
+            "Training batch size in tokens (e.g. 4194304). "
+            "Recommended for checkpoint models. "
+            "Used to compute tokens_trained = train_batch_size * step."
+        ),
+    )
+    tokens_trained: Optional[int] = Field(
+        default=None,
+        description=(
+            "Total tokens trained (e.g. 100000000000 or '100B'). "
+            "Recommended for non-checkpoint models. "
+            "For checkpoints, derived from train_batch_size * step."
+        ),
+    )
+
+    @field_validator("tokens_trained", mode="before")
+    @classmethod
+    def parse_human_readable_int(cls, v):
+        return _parse_human_int(v)
 
     @model_validator(mode="after")
     def validate_checkpoint_fields(self):
@@ -29,6 +87,24 @@ class ModelEntry(BaseModel):
             )
         if self.steps is not None and len(self.steps) == 0:
             raise ValueError("'steps' must not be empty when provided")
+        return self
+
+    @model_validator(mode="after")
+    def warn_training_metadata(self):
+        import warnings
+        is_checkpoint = self.checkpoint_pattern is not None
+        if is_checkpoint and self.train_batch_size is None:
+            warnings.warn(
+                f"Model '{self.display_name}': 'train_batch_size' is recommended "
+                f"for checkpoint models (needed to compute tokens_trained per step)",
+                stacklevel=2,
+            )
+        if not is_checkpoint and self.tokens_trained is None:
+            warnings.warn(
+                f"Model '{self.display_name}': 'tokens_trained' is recommended "
+                f"for non-checkpoint models",
+                stacklevel=2,
+            )
         return self
 
     def _checkpoint_regex(self) -> re.Pattern[str]:

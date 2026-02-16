@@ -92,18 +92,37 @@ output_path: "eval_results/hplt2c_deu"
 request_cache_dir: "lm_eval_requests_cache"  # optional: shared request cache for lm-eval (LM_HARNESS_CACHE_PATH)
 
 models:
-  HPLT2c_deu:
+  HPLT2c_deu_main:
+    model_key: HPLT2c_deu
     path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_deu_checkpoints/main"
+    display_name: "HPLT2c deu"
+    tokens_trained: 100B
 
   HPLT2c_deu_checkpoints:
+    model_key: HPLT2c_deu
     path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_deu_checkpoints"
     checkpoint_pattern: "checkpoint_{step}"
     steps: [5000, 10000, 20000, 30000, 40000]
+    display_name: "HPLT2c deu"
+    train_batch_size: 2_097_152
 
-  HPLT2c_eng:
+  HPLT2c_eng_main:
+    model_key: HPLT2c_eng
     path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_eng_checkpoints/main"
+    display_name: "HPLT2c eng"
+    tokens_trained: 100B
 
   HPLT2c_eng_checkpoints:
+    model_key: HPLT2c_eng
     path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_eng_checkpoints"
     checkpoint_pattern: "checkpoint_{step}"
     steps: [5000, 10000, 20000, 30000, 40000]
+    display_name: "HPLT2c eng"
+    train_batch_size: 2_097_152
+
+  d01_long:
+    model_key: d01_long
+    path: /leonardo_scratch/large/userexternal/mfromm00/SoofiTraining/hf_exports/d01_long
+    checkpoint_pattern: "iter_{step}"
+    display_name: "D01"
+    train_batch_size: 2_097_152
