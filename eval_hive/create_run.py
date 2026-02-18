@@ -7,8 +7,8 @@ from pathlib import Path
 
 from loguru import logger
 
-from eval_hive.collect import parse_step_from_label
 from eval_hive.config import EhConfig, load_config
+
 
 
 # ── Manifest ──────────────────────────────────────────────────
@@ -36,7 +36,7 @@ def build_manifest(config: EhConfig) -> dict[str, dict]:
     manifest = {}
     for config_key, entry in config.models.items():
         effective_model_key = entry.model_key or config_key
-        for label, path in entry.resolve_model_paths():
+        for label, step, path in entry.resolve_model_paths():
             key = manifest_key(effective_model_key, label)
             if key in manifest:
                 raise ValueError(
@@ -46,19 +46,207 @@ def build_manifest(config: EhConfig) -> dict[str, dict]:
                 )
             tokens_trained = entry.tokens_trained
             if tokens_trained is None and entry.train_batch_size is not None:
-                step = parse_step_from_label(label)
                 if step is not None:
                     tokens_trained = entry.train_batch_size * step
 
             manifest[key] = {
                 "model_key": effective_model_key,
                 "label": label,
+                "step": step,
                 "model_path": str(path),
                 "display_name": entry.display_name,
                 "train_batch_size": entry.train_batch_size,
                 "tokens_trained": tokens_trained,
             }
     return manifest
+
+
+# ── HF sync ──────────────────────────────────────────────────
+
+
+def sync_hf_markers(
+    run_dir: Path,
+    manifest: dict[str, dict],
+    task_map: dict[str, list[str]],
+    suites: list[str],
+    hf_repo: str,
+    progress_dir: Path,
+) -> dict[str, list[str]]:
+    """Write a skip list for leaf tasks already covered in HuggingFace.
+
+    Produces ``eh_hf_covered.json`` in *run_dir* mapping manifest keys to
+    their covered leaf task names.  The SLURM job script reads this file
+    at startup and skips those tasks (no per-task marker files needed).
+
+    Manifest keys where *all* leaf tasks are covered are also appended to
+    ``jobs_completed.log`` so that ``submit`` skips them entirely.
+    """
+    from eval_hive.results.hf import download_hf_parquet
+
+    logger.info("Syncing HF coverage from {}...", hf_repo)
+
+    df = download_hf_parquet(hf_repo)
+    if df is None or len(df) == 0:
+        logger.info("No HF data found, skipping HF sync")
+        return {}
+
+    # Collect all expected leaf tasks across suites
+    all_expected_tasks: set[str] = set()
+    for suite in suites:
+        all_expected_tasks.update(task_map.get(suite, []))
+
+    if not all_expected_tasks:
+        return {}
+
+    # Build lookup of (model, step, task) tuples present in HF
+    hf_tuples: set[tuple[str, int | None, str]] = set()
+    for row in df.select("model", "step", "task").unique().iter_rows(named=True):
+        step = None if row["step"] is None else int(row["step"])
+        hf_tuples.add((row["model"], step, row["task"]))
+
+    covered: dict[str, list[str]] = {}
+    keys_completed: list[str] = []
+
+    for mkey, entry in manifest.items():
+        model_key = entry["model_key"]
+        label = entry["label"]
+        step = entry.get("step")
+
+        covered_tasks = sorted(
+            task for task in all_expected_tasks
+            if (model_key, step, task) in hf_tuples
+        )
+
+        if covered_tasks:
+            covered[mkey] = covered_tasks
+
+        if len(covered_tasks) == len(all_expected_tasks):
+            keys_completed.append(mkey)
+
+    # Write single coverage file (job script reads this)
+    hf_covered_path = run_dir / "eh_hf_covered.json"
+    hf_covered_path.write_text(json.dumps(covered, indent=2))
+
+    # Write fully-covered keys to completed log
+    if keys_completed:
+        completed_file = progress_dir / "jobs_completed.log"
+        existing: set[str] = set()
+        if completed_file.exists():
+            existing = {
+                line.strip()
+                for line in completed_file.read_text().splitlines()
+                if line.strip()
+            }
+        new_keys = [k for k in keys_completed if k not in existing]
+        if new_keys:
+            with open(completed_file, "a") as f:
+                for key in new_keys:
+                    f.write(f"{key}\n")
+
+    total_tasks = sum(len(v) for v in covered.values())
+    logger.info(
+        "HF sync: {}/{} tasks covered, {}/{} jobs fully covered",
+        total_tasks, len(manifest) * len(all_expected_tasks),
+        len(keys_completed), len(manifest),
+    )
+
+    return covered
+
+
+def _collect_completed_tasks(base: Path) -> set[str]:
+    """Scan all result files under *base* to find completed task names.
+
+    Handles both per-task directories (old format) and batch directories
+    (new format) by parsing the ``results`` key from each result file.
+    """
+    completed: set[str] = set()
+    if not base.is_dir():
+        return completed
+    for subdir in base.iterdir():
+        if not subdir.is_dir():
+            continue
+        for rf in subdir.glob("results_*.json"):
+            try:
+                data = json.loads(rf.read_text())
+                completed.update(data.get("results", {}).keys())
+            except (json.JSONDecodeError, OSError):
+                continue
+    return completed
+
+
+def count_task_coverage(
+    output_path: Path,
+    manifest: dict[str, dict],
+    all_tasks: set[str],
+    hf_covered: dict[str, list[str]] | None = None,
+) -> tuple[int, int, int, int, int]:
+    """Count leaf-task coverage across all manifest keys.
+
+    Returns (total, on_disk, on_hf_only, jobs_covered, jobs_remaining).
+    """
+    total = len(manifest) * len(all_tasks)
+    n_disk = 0
+    n_hf_only = 0
+    jobs_covered = 0
+
+    # Cache completed tasks per (model_key, label) to avoid re-parsing
+    # the same result files for manifest entries that share a directory.
+    _cache: dict[tuple[str, str], set[str]] = {}
+
+    for mkey, entry in manifest.items():
+        mk, lbl = entry["model_key"], entry["label"]
+        cache_key = (mk, lbl)
+        if cache_key not in _cache:
+            base = output_path / mk / lbl
+            _cache[cache_key] = _collect_completed_tasks(base)
+        completed = _cache[cache_key]
+
+        hf_tasks = set(hf_covered.get(mkey, [])) if hf_covered else set()
+        key_covered = 0
+
+        for task in all_tasks:
+            if task in completed:
+                n_disk += 1
+                key_covered += 1
+            elif task in hf_tasks:
+                n_hf_only += 1
+                key_covered += 1
+
+        if key_covered == len(all_tasks):
+            jobs_covered += 1
+
+    jobs_remaining = len(manifest) - jobs_covered
+    return total, n_disk, n_hf_only, jobs_covered, jobs_remaining
+
+
+def display_run_summary(
+    output_path: Path,
+    manifest: dict[str, dict],
+    task_map: dict[str, list[str]],
+    suites: list[str],
+    hf_covered: dict[str, list[str]] | None = None,
+) -> None:
+    """Print a summary table of job and task coverage."""
+    from tabulate import tabulate
+
+    all_tasks: set[str] = set()
+    for s in suites:
+        all_tasks.update(task_map.get(s, []))
+
+    total, n_disk, n_hf_only, jobs_covered, jobs_remaining = count_task_coverage(
+        output_path, manifest, all_tasks, hf_covered,
+    )
+    n_remaining = total - n_disk - n_hf_only
+
+    rows = [
+        ["Total", f"{len(manifest)} jobs, {len(all_tasks)} tasks per job"],
+        ["On disk", f"{n_disk} tasks"],
+    ]
+    if hf_covered:
+        rows.append(["On HF", f"{n_hf_only} tasks"])
+    rows.append(["To evaluate", f"{jobs_remaining} jobs, {n_remaining} tasks"])
+
+    print(tabulate(rows, tablefmt="rounded_outline"))
 
 
 # ── Template helpers ──────────────────────────────────────────
@@ -246,6 +434,18 @@ EH_OUTPUT_BASE="{output_path}/${{EH_MODEL_KEY}}/${{EH_LABEL}}"
 # ── Suites to evaluate ────────────────────────────────────────
 EH_SUITES={suites_bash_array}
 
+# ── HF-covered tasks (skip list from create-run) ─────────────
+declare -A EH_HF_COVERED
+HF_COVERED_FILE="$RUN_DIR/eh_hf_covered.json"
+if [ -f "$HF_COVERED_FILE" ]; then
+    while IFS= read -r task; do
+        EH_HF_COVERED["$task"]=1
+    done < <(jq -r ".[\"${{TASK_KEY}}\"][]? // empty" "$HF_COVERED_FILE")
+    if [ ${{#EH_HF_COVERED[@]}} -gt 0 ]; then
+        log "INFO" "HF coverage: ${{#EH_HF_COVERED[@]}} task(s) will be skipped"
+    fi
+fi
+
 # ── Signal handling ───────────────────────────────────────────
 # shutdown_servers() is defined by the server lifecycle block below.
 
@@ -316,7 +516,7 @@ unset SLURM_MEM_PER_CPU SLURM_MEM_PER_GPU SLURM_MEM_PER_NODE
 
 setsid srun --cpu-bind=none \
     --output="$INFERENCE_SERVER_LOG" --error="$INFERENCE_SERVER_LOG" \
-    --export=ALL,NO_COLOR=1,VLLM_LOGGING_NO_COLOR=1 \
+    --export=ALL,NO_COLOR=1 \
     bash -c "${{SERVER_COMMAND}}" &
 SERVER_PID=$!
 
@@ -374,7 +574,7 @@ shutdown_servers() {{
             kill -INT -$SERVER_PID 2>/dev/null || kill -INT $SERVER_PID 2>/dev/null
         fi
         local wait_count=0
-        while [ $wait_count -lt 30 ] && kill -0 $SERVER_PID 2>/dev/null; do
+        while [ $wait_count -lt 15 ] && kill -0 $SERVER_PID 2>/dev/null; do
             sleep 1
             wait_count=$((wait_count + 1))
         done
@@ -463,7 +663,7 @@ for i in $(seq 0 $((NUM_SERVERS - 1))); do
         --nodes=$NODES_PER_SERVER \
         --nodelist="$NODELIST" \
         --output="$SERVER_LOG" --error="$SERVER_LOG" \
-        --export=ALL,NO_COLOR=1,VLLM_LOGGING_NO_COLOR=1 \
+        --export=ALL,NO_COLOR=1 \
         bash -c "$SERVER_COMMAND" &
 
     SERVER_PIDS[$i]=$!
@@ -589,7 +789,7 @@ shutdown_servers() {{
         log "INFO" "Stopping load balancer (PID: $LB_PID)"
         kill -TERM $LB_PID 2>/dev/null || true
         local wc=0
-        while [ $wc -lt 10 ] && kill -0 $LB_PID 2>/dev/null; do
+        while [ $wc -lt 5 ] && kill -0 $LB_PID 2>/dev/null; do
             sleep 1
             wc=$((wc + 1))
         done
@@ -597,7 +797,7 @@ shutdown_servers() {{
             kill -KILL $LB_PID 2>/dev/null || true
         fi
     fi
-    # Send SIGINT to all inference servers
+    # Send SIGINT to all inference servers at once
     for i in $(seq 0 $((NUM_SERVERS - 1))); do
         local pid=${{SERVER_PIDS[$i]:-}}
         if [ -n "$pid" ] && kill -0 $pid 2>/dev/null; then
@@ -605,19 +805,24 @@ shutdown_servers() {{
             kill -INT -$pid 2>/dev/null || kill -INT $pid 2>/dev/null
         fi
     done
-    # Wait for servers to exit
+    # Wait for all servers in parallel (single countdown)
+    local wc=0
+    while [ $wc -lt 15 ]; do
+        local still_alive=0
+        for i in $(seq 0 $((NUM_SERVERS - 1))); do
+            local pid=${{SERVER_PIDS[$i]:-}}
+            [ -n "$pid" ] && kill -0 $pid 2>/dev/null && still_alive=1
+        done
+        [ $still_alive -eq 0 ] && break
+        sleep 1
+        wc=$((wc + 1))
+    done
+    # Force kill any survivors
     for i in $(seq 0 $((NUM_SERVERS - 1))); do
         local pid=${{SERVER_PIDS[$i]:-}}
-        if [ -n "$pid" ]; then
-            local wc=0
-            while [ $wc -lt 30 ] && kill -0 $pid 2>/dev/null; do
-                sleep 1
-                wc=$((wc + 1))
-            done
-            if kill -0 $pid 2>/dev/null; then
-                log "WARN" "Force killing server $i"
-                kill -KILL -$pid 2>/dev/null || kill -KILL $pid 2>/dev/null
-            fi
+        if [ -n "$pid" ] && kill -0 $pid 2>/dev/null; then
+            log "WARN" "Force killing server $i"
+            kill -KILL -$pid 2>/dev/null || kill -KILL $pid 2>/dev/null
         fi
     done
 }}
@@ -637,8 +842,8 @@ EVAL_FAILURES=0
 for SUITE in "${{EH_SUITES[@]}}"; do
     SUITE_OUTPUT_DIR="$EH_OUTPUT_BASE/$SUITE"
 
-    # Runtime dedup: skip if results already exist
-    if ls "$SUITE_OUTPUT_DIR"/results_*.json 1>/dev/null 2>&1; then
+    # Runtime dedup: skip if results already exist or covered by HF
+    if ls "$SUITE_OUTPUT_DIR"/results_*.json 1>/dev/null 2>&1 || [ -n "${{EH_HF_COVERED[$SUITE]+x}}" ]; then
         log "INFO" "[$SUITE] Results already exist — skipping"
         continue
     fi
@@ -669,6 +874,7 @@ EVAL_LOOP_PARALLEL = r"""
 # ── Build deduplicated flat task list ────────────────────────
 TASK_MAP_FILE="$RUN_DIR/eh_task_map.json"
 PARALLEL_TASKS={parallel_tasks}
+TASK_BATCH_SIZE={task_batch_size}
 
 # Collect unique leaf tasks across all suites, interleaved (round-robin)
 # so that tasks from different suites are mixed rather than sequential.
@@ -701,67 +907,112 @@ for (( i=0; i < MAX_LEN; i++ )); do
     done
 done
 
-log "INFO" "Total unique tasks: ${{#ALL_TASKS[@]}} (from ${{#EH_SUITES[@]}} suite(s), parallel=$PARALLEL_TASKS)"
+log "INFO" "Total unique tasks: ${{#ALL_TASKS[@]}} (from ${{#EH_SUITES[@]}} suite(s), parallel=$PARALLEL_TASKS, batch_size=$TASK_BATCH_SIZE)"
 
-# ── Run lm-eval per task with worker pool ────────────────────
+# ── Filter out already-completed tasks ───────────────────────
+# Scan existing result files (handles both per-task and batch directories)
+declare -A DONE_TASKS
+for result_file in "$EH_OUTPUT_BASE"/*/results_*.json; do
+    [ -f "$result_file" ] || continue
+    while IFS= read -r task; do
+        DONE_TASKS["$task"]=1
+    done < <(jq -r '.results | keys[]' "$result_file")
+done
+
+REMAINING=()
+for TASK in "${{ALL_TASKS[@]}}"; do
+    [ -n "${{DONE_TASKS[$TASK]+x}}" ] && continue
+    [ -n "${{EH_HF_COVERED[$TASK]+x}}" ] && continue
+    REMAINING+=("$TASK")
+done
+
+SKIPPED=$(( ${{#ALL_TASKS[@]}} - ${{#REMAINING[@]}} ))
+if [ $SKIPPED -gt 0 ]; then
+    log "INFO" "Skipping $SKIPPED already-completed task(s), ${{#REMAINING[@]}} remaining"
+fi
+
+if [ ${{#REMAINING[@]}} -eq 0 ]; then
+    log "INFO" "All tasks already completed — nothing to evaluate"
+fi
+
+# ── Compute effective batch size ─────────────────────────────
+# Don't under-parallelize: if we have fewer tasks than parallel_tasks,
+# use batch_size=1 so each gets its own slot.
+EFF_BATCH_SIZE=$TASK_BATCH_SIZE
+if (( ${{#REMAINING[@]}} <= PARALLEL_TASKS )); then
+    EFF_BATCH_SIZE=1
+elif (( TASK_BATCH_SIZE > (${{#REMAINING[@]}} + PARALLEL_TASKS - 1) / PARALLEL_TASKS )); then
+    # Also cap batch size so we fill all parallel slots
+    EFF_BATCH_SIZE=$(( (${{#REMAINING[@]}} + PARALLEL_TASKS - 1) / PARALLEL_TASKS ))
+fi
+
+# ── Build batches ────────────────────────────────────────────
+declare -a BATCHES=()
+BATCH_IDX=0
+for (( i=0; i < ${{#REMAINING[@]}}; i+=EFF_BATCH_SIZE )); do
+    BATCH_CSV=""
+    for (( j=i; j < i+EFF_BATCH_SIZE && j < ${{#REMAINING[@]}}; j++ )); do
+        [ -n "$BATCH_CSV" ] && BATCH_CSV+=","
+        BATCH_CSV+="${{REMAINING[$j]}}"
+    done
+    BATCHES+=("$BATCH_CSV")
+done
+
+log "INFO" "Created ${{#BATCHES[@]}} batch(es) of up to $EFF_BATCH_SIZE task(s)"
+
+# ── Run batched lm-eval with worker pool ─────────────────────
 EVAL_FAILURES=0
 
-run_single_task() {{
-    local TASK="$1"
-    local TASK_OUTPUT_DIR="$EH_OUTPUT_BASE/$TASK"
+run_task_batch() {{
+    local BATCH_IDX="$1"
+    local TASKS_CSV="$2"
+    local BATCH_DIR="$EH_OUTPUT_BASE/batch_${{SLURM_JOB_ID}}_$(printf '%03d' $BATCH_IDX)"
 
-    # Per-task dedup (works across job restarts since output is flat by task name)
-    if ls "$TASK_OUTPUT_DIR"/results_*.json 1>/dev/null 2>&1; then
-        log "INFO" "[$TASK] Results already exist — skipping"
-        return 0
-    fi
-
-    mkdir -p "$TASK_OUTPUT_DIR"
-    log "INFO" "[$TASK] Starting evaluation"
+    mkdir -p "$BATCH_DIR"
+    log "INFO" "[batch $BATCH_IDX] Starting evaluation: $TASKS_CSV"
 
     lm_eval run \
         {lm_eval_extra_args} \
         --model_args "{model_args_string}" \
-        --tasks "$TASK" \
+        --tasks "$TASKS_CSV" \
         {include_path_arg} \
-        --output_path "$TASK_OUTPUT_DIR/results.json" \
-        >"$TASK_OUTPUT_DIR/lm_eval.log" 2>&1
+        --output_path "$BATCH_DIR/results.json" \
+        >"$BATCH_DIR/lm_eval.log" 2>&1
 
     local LM_EVAL_EXIT=$?
     if [ $LM_EVAL_EXIT -eq 0 ]; then
-        log "INFO" "[$TASK] Completed successfully"
+        log "INFO" "[batch $BATCH_IDX] Completed successfully"
     else
-        log "ERROR" "[$TASK] Failed with exit code $LM_EVAL_EXIT"
+        log "ERROR" "[batch $BATCH_IDX] Failed with exit code $LM_EVAL_EXIT"
     fi
     return $LM_EVAL_EXIT
 }}
 
 # Worker pool with manual PID tracking.
-# (Cannot use $(jobs -rp | wc -l) — runs in a subshell that can't see parent's jobs.)
-declare -a TASK_PIDS=()
+declare -a BATCH_PIDS=()
 
-for TASK in "${{ALL_TASKS[@]}}"; do
+for (( b=0; b < ${{#BATCHES[@]}}; b++ )); do
     # If at capacity, wait for a slot to free up
-    while (( ${{#TASK_PIDS[@]}} >= PARALLEL_TASKS )); do
+    while (( ${{#BATCH_PIDS[@]}} >= PARALLEL_TASKS )); do
         STILL_RUNNING=()
-        for pid in "${{TASK_PIDS[@]}}"; do
+        for pid in "${{BATCH_PIDS[@]}}"; do
             if kill -0 "$pid" 2>/dev/null; then
                 STILL_RUNNING+=("$pid")
             else
                 wait "$pid" || EVAL_FAILURES=$((EVAL_FAILURES + 1))
             fi
         done
-        TASK_PIDS=("${{STILL_RUNNING[@]}}")
-        if (( ${{#TASK_PIDS[@]}} >= PARALLEL_TASKS )); then
+        BATCH_PIDS=("${{STILL_RUNNING[@]}}")
+        if (( ${{#BATCH_PIDS[@]}} >= PARALLEL_TASKS )); then
             sleep 1
         fi
     done
-    run_single_task "$TASK" &
-    TASK_PIDS+=($!)
+    run_task_batch "$b" "${{BATCHES[$b]}}" &
+    BATCH_PIDS+=($!)
 done
 
-# Wait for all remaining tasks
-for pid in "${{TASK_PIDS[@]}}"; do
+# Wait for all remaining batches
+for pid in "${{BATCH_PIDS[@]}}"; do
     wait "$pid" || EVAL_FAILURES=$((EVAL_FAILURES + 1))
 done
 """
@@ -951,7 +1202,7 @@ def run(args: argparse.Namespace) -> int:
         server_shutdown_block = ""
 
     # Resolve suite/group names to leaf tasks and write task map into run directory.
-    # Always generated (used by collect --check-hf and status, not just parallel mode).
+    # Always generated (used by HF sync, status, and parallel eval mode).
     from lm_eval.tasks import TaskManager
     from eval_hive.prepare import resolve_task_names
 
@@ -965,6 +1216,18 @@ def run(args: argparse.Namespace) -> int:
     task_map_dst.write_text(json.dumps(task_map, indent=2))
     logger.info(f"Task map written to: {task_map_dst}")
 
+    # HF sync: write skip list for tasks already in HuggingFace
+    hf_covered: dict[str, list[str]] | None = None
+    if config.hf_result_repo:
+        hf_covered = sync_hf_markers(
+            run_dir=run_dir,
+            manifest=manifest,
+            task_map=task_map,
+            suites=config.eval.suites_and_tasks,
+            hf_repo=config.hf_result_repo,
+            progress_dir=progress_dir,
+        )
+
     # Eval loop block: parallel (per-task) or sequential (per-suite)
     eval_format_vars = {
         "lm_eval_extra_args": build_lm_eval_extra_args(config),
@@ -974,6 +1237,7 @@ def run(args: argparse.Namespace) -> int:
     if config.parallel_tasks > 1:
         eval_loop_block = EVAL_LOOP_PARALLEL.format(
             parallel_tasks=config.parallel_tasks,
+            task_batch_size=config.task_batch_size,
             **eval_format_vars,
         )
     else:
@@ -1017,6 +1281,13 @@ def run(args: argparse.Namespace) -> int:
     logger.info(f"SLURM job script generated: {job_script}")
 
     logger.info(f"Run created at: {run_dir}")
+
+    # Display coverage summary
+    display_run_summary(
+        config.output_path, manifest, task_map,
+        config.eval.suites_and_tasks, hf_covered,
+    )
+
     return 0
 
 

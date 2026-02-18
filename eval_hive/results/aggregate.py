@@ -7,6 +7,7 @@ benchmark scores.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -195,6 +196,17 @@ def aggregate_scores(
     # Unique (model, step) combos
     model_steps = leaf_df.select("model", "step").unique().rows()
 
+    # Pre-compute which metrics each task can report.
+    # Groups: from their aggregate_metric_list.
+    # Leaves: from the metrics actually present in the scores data.
+    task_reported_metrics: dict[str, set[str]] = {}
+    for gname, ginfo in hierarchy.items():
+        task_reported_metrics[gname] = {am.metric for am in ginfo.aggregate_metrics}
+    for _, _, tname, mname, _ in scores:
+        if tname not in task_reported_metrics:
+            task_reported_metrics[tname] = set()
+        task_reported_metrics[tname].add(mname)
+
     suite_set = set(suites)
     aggregate_rows: list[dict] = []
 
@@ -220,12 +232,20 @@ def aggregate_scores(
                 # Default filter — most metrics use "none"
                 metric_filter = "none"
 
+                # Only children that can report this metric are applicable.
+                applicable_children = [
+                    c for c in group.children
+                    if metric_name in task_reported_metrics.get(c, set())
+                ]
+                if not applicable_children:
+                    continue
+
                 # Collect children's scores for this metric
                 child_scores: list[float] = []
                 child_weights: list[int] = []
                 subtask_children: list[str] = []
 
-                for child_name in group.children:
+                for child_name in applicable_children:
                     child_key = (model, step_val, child_name, metric_name, metric_filter)
                     child_row = scores.get(child_key)
                     if child_row is None or child_row.get("score") is None:
@@ -234,7 +254,14 @@ def aggregate_scores(
                     child_weights.append(child_row.get("n_samples") or 1)
                     subtask_children.append(child_name)
 
-                if not child_scores:
+                if len(child_scores) < len(applicable_children):
+                    if child_scores:
+                        logger.warning(
+                            "Skipping aggregate for %s (%s, step=%s, %s): "
+                            "only %d/%d applicable children have scores",
+                            group_name, model, step_val, metric_name,
+                            len(child_scores), len(applicable_children),
+                        )
                     continue
 
                 # Compute aggregate
@@ -337,6 +364,14 @@ def aggregate_scores(
     if not aggregate_rows:
         logger.info("No aggregate scores computed (no matching leaf data)")
         return pl.DataFrame()
+
+    # Pre-serialize subtask_tree dicts to JSON strings before creating the
+    # DataFrame.  Polars infers a Struct schema from the first non-null dict
+    # it sees, silently dropping keys that don't match — corrupting every
+    # other group's tree.  Storing as plain strings avoids this.
+    for row in aggregate_rows:
+        if row.get("subtask_tree") is not None:
+            row["subtask_tree"] = json.dumps(row["subtask_tree"])
 
     logger.info("Computed %d aggregate score rows", len(aggregate_rows))
     return pl.DataFrame(aggregate_rows)

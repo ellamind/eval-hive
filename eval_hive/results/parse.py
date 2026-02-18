@@ -237,6 +237,8 @@ def parse_result_file(
                 continue
             if "_stderr," in metric_key:
                 continue  # stderr is paired with its primary metric below
+            if "," not in metric_key:
+                continue  # metadata keys like "name", "sample_len"
 
             metric_name, metric_filter = metric_key.split(",", 1)
 

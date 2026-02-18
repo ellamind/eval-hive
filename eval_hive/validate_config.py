@@ -1,5 +1,4 @@
 import argparse
-import re
 import sys
 from pathlib import Path
 
@@ -51,13 +50,9 @@ def run(args: argparse.Namespace) -> int:
         is_checkpoint = entry.checkpoint_pattern is not None
         display = entry.display_name
         model_paths = entry.resolve_model_paths()
-        for label, path in model_paths:
+        for label, step, path in model_paths:
             exists = path.is_dir() or path.is_file()
             key = manifest_key(effective_model_key, label)
-            step = None
-            if is_checkpoint:
-                matches = re.findall(r"\d+", label)
-                step = int(matches[-1]) if matches else None
             tokens = entry.tokens_trained
             if tokens is None and entry.train_batch_size is not None and step is not None:
                 tokens = entry.train_batch_size * step

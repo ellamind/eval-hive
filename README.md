@@ -10,11 +10,11 @@ eval-hive manages the full evaluation lifecycle. Configure models and eval suite
 - **Slurm native** — automatic job script generation, array jobs, resource management, signal handling.
 - **Any lm-eval backend** — works with vLLM, sglang, or serverless backends (hf, nemo). Any lm-eval task works out of the box.
 - **Flexible server deployment** — single-node, multi-node, or multiple independent inference servers behind a built-in load balancer for high throughput eval.
-- **Parallel task execution** — run multiple lm-eval processes concurrently to keep GPUs busy.
+- **Parallel task execution** — run multiple lm-eval processes concurrently to keep GPUs busy, with configurable task batching to reduce filesystem I/O on parallel filesystems.
 - **Request caching** — pre-build lm-eval request caches for fast, race-free distribution to compute nodes.
 - **Result collection** — collect lm-eval results into a parquet file with automatic score aggregation for task groups and eval suites.
-- **HuggingFace sync** — optionally push results to a HF dataset repo, with merge and dedup. Skip already-covered jobs at submit time with `--check-hf`.
-- **Deduplication** — skips already-completed work at submit time, runtime, and optionally against a HF dataset. Resubmit safely after partial failures.
+- **HuggingFace sync** — configure `hf_result_repo` once and eval-hive handles the rest: `create-run` syncs coverage from HF to skip already-evaluated tasks, `collect --upload` pushes results back.
+- **Deduplication** — skips already-completed work at three levels: submit time (completed log + SLURM queue), HF coverage (synced at create-run), and runtime (existing result files). Resubmit safely after partial failures.
 - **Failure handling** — per-task resumability, SIGUSR1 graceful shutdown, idempotent resubmission.
 - **Pydantic config validation** — catches errors before any jobs are submitted.
 
@@ -51,9 +51,9 @@ pixi run eval-hive submit runs/my-run
 # 6. Monitor progress
 pixi run eval-hive status runs/my-run
 
-# 7. Collect results into parquet (with optional HF push)
+# 7. Collect results into parquet (with optional HF upload)
 pixi run eval-hive collect runs/my-run
-pixi run eval-hive collect runs/my-run --push-to org/eval-scores
+pixi run eval-hive collect runs/my-run --upload
 ```
 
 ## Workflow
@@ -66,9 +66,9 @@ pixi run eval-hive collect runs/my-run --push-to org/eval-scores
   │ prepare  │───►│ create_run │───►│  submit  │───►│  slurm job per model      │
   │          │    │            │    │          │    │                           │
   │ download │    │ plan work  │    │ sbatch   │    │ (optional) start server(s)│
-  │ datasets │    │ check done │    │ array    │    │ (optional) load balancer  │
-  │ + caches │    │ write      │    │ jobs     │    │ run lm_eval suites        │
-  │ + tarball│    │ manifest   │    │          │    │ write results             │
+  │ datasets │    │ write      │    │ array    │    │ (optional) load balancer  │
+  │ + caches │    │ manifest   │    │ jobs     │    │ run lm_eval suites        │
+  │ + tarball│    │ HF sync    │    │          │    │ write results             │
   └──────────┘    └────────────┘    └──────────┘    └───────────────────────────┘
                                          │
                                     ┌────┴─────┐
@@ -107,7 +107,6 @@ pixi run eval-hive submit runs/my-run
 pixi run eval-hive submit runs/my-run --dry                      # preview only
 pixi run eval-hive submit runs/my-run --limit 5                  # submit at most 5 jobs
 pixi run eval-hive submit runs/my-run --retry-interval 10        # retry every 10 min until all submitted
-pixi run eval-hive submit runs/my-run --check-hf org/eval-scores # skip jobs covered in HF dataset
 
 # Monitor progress
 pixi run eval-hive status runs/my-run
@@ -116,7 +115,8 @@ pixi run eval-hive status runs/my-run --detailed                 # per-suite/tas
 # Collect results into parquet
 pixi run eval-hive collect runs/my-run                           # writes scores.parquet
 pixi run eval-hive collect runs/my-run -o my_scores.parquet      # custom output path
-pixi run eval-hive collect runs/my-run --push-to org/eval-scores # merge + dedup + upload to HF
+pixi run eval-hive collect runs/my-run --upload                  # merge + dedup + upload to HF (uses hf_result_repo from config)
+pixi run eval-hive collect runs/my-run --upload org/other-scores # override HF repo
 
 # Cancel all active jobs for a run
 pixi run eval-hive cancel runs/my-run
@@ -203,17 +203,19 @@ The `create_run` step resolves the config into a concrete execution plan:
 
 1. **Loads config** and validates with Pydantic.
 2. **Builds manifest** — iterates all models, resolves checkpoint patterns, produces a flat mapping of `{model_key, label, model_path, display_name, train_batch_size, tokens_trained}` dicts keyed by `{model_key}--{label}`. The `model_key` comes from the entry's `model_key` field (or the config dict key if not set).
-3. **Generates run directory** containing:
+3. **HF sync** (when `hf_result_repo` is set) — downloads the HF dataset parquet and writes `eh_hf_covered.json`, a skip list mapping manifest keys to their already-covered leaf tasks. The job script reads this at startup so individual tasks are skipped without running lm-eval. Manifest keys where all tasks are covered are also written to `jobs_completed.log` so `submit` skips them entirely. This is a one-time sync — HF data is assumed stable for the lifetime of the run.
+4. **Generates run directory** containing:
    - `eh_manifest.json` — the manifest (read by `jq` in the job script)
    - `eh_config.yaml` — frozen copy of the input config
    - `eh_job.slurm` — generated SBATCH script with all config baked in
+   - `eh_hf_covered.json` — HF coverage skip list (if `hf_result_repo` is set)
    - `logs/` and `progress/` directories
 
 The generated Slurm script handles the full job lifecycle:
 - Reads its manifest entry via `jq .[${SLURM_ARRAY_TASK_ID}]`
 - Sets `EH_MODEL_PATH`, `EH_PORT` (random 30000–59999), environment variables
 - Optionally starts inference server, runs health checks, shuts down on completion
-- Loops over all suites, skipping any with existing `results_*.json` (runtime dedup)
+- Loops over all suites, skipping any with existing `results_*.json` or HF coverage (runtime dedup)
 - Uses `--output_path` with `.json` suffix so lm-eval writes directly to the suite directory without creating model subdirectories
 - Signal handling: SIGUSR1 (approaching timeout) triggers auto-resubmission, SIGTERM marks failure
 - Records completion/failure to append-only logs
@@ -231,21 +233,24 @@ Job array index 2 → model-A/ckpt-20000    → [suite_easy, suite_main]
 Job array index 3 → model-B               → [suite_easy, suite_main]
 ```
 
-### Parallel per-task execution (`parallel_tasks`)
+### Parallel per-task execution (`parallel_tasks` + `task_batch_size`)
 
 By default (`parallel_tasks: 1`), suites are evaluated sequentially — one `lm_eval` process at a time. lm-eval tokenizes all requests on a single CPU core before sending any API calls, which causes a multi-minute stall with GPUs idle for large suites.
 
-With `parallel_tasks: N` (N > 1), suites are expanded into their individual leaf tasks (e.g., `my_suite_easy` → `arc_easy_rc`, `hellaswag_rc`, ...) and up to N `lm_eval` processes run concurrently, each handling one task. This spreads tokenization across multiple CPU cores while the inference server handles concurrent requests from all processes.
+With `parallel_tasks: N` (N > 1), suites are expanded into their individual leaf tasks (e.g., `my_suite_easy` → `arc_easy_rc`, `hellaswag_rc`, ...) and up to N `lm_eval` processes run concurrently. This spreads tokenization across multiple CPU cores while the inference server handles concurrent requests from all processes.
 
-`create_run` resolves suite/group names to leaf tasks and writes `eh_task_map.json` into the run directory. At runtime, the Slurm script reads it to build a deduplicated task list (tasks shared across suites are evaluated once).
+Tasks are grouped into **batches** of `task_batch_size` (default 8) and each batch is passed to a single `lm_eval` invocation as a comma-separated `--tasks` list. This reduces filesystem I/O on parallel filesystems (GPFS/Lustre) by minimizing the number of concurrent processes, directories, and result files. The effective batch size is automatically capped so that all `parallel_tasks` slots are utilized — e.g. with 4 remaining tasks and `parallel_tasks: 8`, each task gets its own slot (batch size 1).
 
-Results and per-task logs are stored flat by task name:
+`create_run` resolves suite/group names to leaf tasks and writes `eh_task_map.json` into the run directory. At runtime, the Slurm script reads it to build a deduplicated task list (tasks shared across suites are evaluated once), filters out already-completed tasks by scanning existing result files, and batches the remainder.
+
+Results are stored in batch directories:
 ```
-{output_path}/{model_key}/{label}/{task_name}/results_*.json
-{output_path}/{model_key}/{label}/{task_name}/lm_eval.log
+{output_path}/{model_key}/{label}/batch_{SLURM_JOB_ID}_{NNN}/results_*.json       # combined scores
+{output_path}/{model_key}/{label}/batch_{SLURM_JOB_ID}_{NNN}/samples_*.jsonl      # per-task sample files
+{output_path}/{model_key}/{label}/batch_{SLURM_JOB_ID}_{NNN}/lm_eval.log          # batch log
 ```
 
-The main Slurm log (`logs/`) only shows task start/finish messages. Full lm-eval output (progress bars, warnings, result tables) is captured exclusively in the per-task `lm_eval.log` files.
+The main Slurm log (`logs/`) only shows batch start/finish messages. Full lm-eval output (progress bars, warnings, result tables) is captured exclusively in the per-batch `lm_eval.log` files.
 
 ### Server scaling (num_nodes_per_inference_server × num_inference_servers)
 
@@ -322,17 +327,20 @@ if inference_server_command is set:
     start_server → health_check → (load_balancer if num_inference_servers > 1)
 fi
 
+load eh_hf_covered.json → EH_HF_COVERED associative array  # HF skip list
+
 # parallel_tasks=1 (sequential, per-suite):
 for suite in eval.suites_and_tasks:
-    if results_*.json exists in output dir: skip
+    if results_*.json exists or suite in EH_HF_COVERED: skip
     lm_eval run --tasks $suite ... > {suite}/lm_eval.log 2>&1
 done
 
-# parallel_tasks>1 (parallel, per-task):
+# parallel_tasks>1 (parallel, batched):
 expand suites → deduplicated leaf tasks via eh_task_map.json
-for task in all_tasks (up to N concurrent):
-    if results_*.json exists in task dir: skip
-    lm_eval run --tasks $task ... > {task}/lm_eval.log 2>&1 &
+scan existing results → filter out completed tasks
+chunk remaining into batches of task_batch_size
+for batch in batches (up to parallel_tasks concurrent):
+    lm_eval run --tasks $batch_csv ... > batch_dir/lm_eval.log 2>&1 &
 done; wait
 
 if inference_server_command is set:
@@ -344,20 +352,20 @@ fi
 
 Three levels of deduplication.
 
-**Submit-time dedup** (`submit.py`): before submitting a job, checks `progress/jobs_completed.log` and the Slurm queue, skipping manifest keys that are already completed or active.
+**Submit-time dedup** (`submit.py`): before submitting a job, checks `progress/jobs_completed.log` and the Slurm queue, skipping manifest keys that are already completed or active. Jobs fully covered by HF data are pre-marked as completed by `create-run`.
 
-**HF-based dedup** (`submit --check-hf`): optionally downloads a HF dataset parquet and skips manifest keys whose expected tasks are already fully covered. Useful for avoiding duplicate work across clusters sharing results via HuggingFace. Respects `HF_HUB_OFFLINE` for cached/offline access.
+**HF-based dedup** (`create-run`): when `hf_result_repo` is set, downloads the HF dataset parquet and writes `eh_hf_covered.json` — a per-manifest-key list of covered leaf tasks. The job script reads this file at startup and skips covered tasks. Manifest keys where all tasks are covered are also written to `jobs_completed.log` so `submit` skips them entirely. Respects `HF_HUB_OFFLINE` for cached/offline access.
 
-**Runtime dedup** (inside each job): before running each suite or task, checks if `results_*.json` already exists in the output directory. Skips work that already has results, enabling partial resumption.
+**Runtime dedup** (inside each job): before batching, scans all existing result files to find completed task names (handles both per-task and batch directories). Completed tasks and HF-covered tasks are filtered out before creating batches. Sequential mode checks per-suite as before.
 
-Results are written to deterministic paths:
+Results are written to:
 
 ```
 # sequential mode (parallel_tasks=1):
 {output_path}/{model_key}/{label}/{suite_name}/results_*.json
 
 # parallel mode (parallel_tasks>1):
-{output_path}/{model_key}/{label}/{task_name}/results_*.json
+{output_path}/{model_key}/{label}/batch_{SLURM_JOB_ID}_{NNN}/results_*.json
 ```
 
 Completion tracking uses a simple append-only log (`progress/jobs_completed.log`). Each completed job appends its task ID. Failed jobs are tracked in `progress/jobs_failed.log` with reasons.
@@ -379,11 +387,11 @@ The `collect` command parses lm-eval result JSON files from a run directory and 
 
 Groups reachable from the configured `suites_and_tasks` are tagged as `eval_suite`; intermediate groups as `task_group`.
 
-**HF push** (`--push-to`): downloads the existing parquet from a HuggingFace dataset repo, merges with local results, deduplicates on `(model, step, task, metric, metric_filter)` keeping the latest `eval_date`, and re-uploads. The local parquet is also updated with the merged result.
+**HF upload** (`--upload`): downloads the existing parquet from the HuggingFace dataset repo (configured via `hf_result_repo`), merges with local results, deduplicates on `(model, step, task, metric, metric_filter)` keeping the latest `eval_date`, and re-uploads. The local parquet is also updated with the merged result. Use `--upload org/other-repo` to override the target repo.
 
 ### Failure handling
 
-- **Per-suite/task resumability**: each suite (or individual task in parallel mode) completes independently. Failures in one don't affect others.
+- **Per-suite/batch resumability**: each suite (sequential mode) or batch (parallel mode) completes independently. Failures in one don't affect others. On restart, completed tasks are detected by scanning existing result files and excluded from new batches.
 - **SIGUSR1 signal handling**: Slurm sends SIGUSR1 before timeout. The job gracefully stops the server, marks progress, and can be resubmitted.
 - **Idempotent resubmission**: `submit` only submits jobs for incomplete work. Run it again after partial completion.
 
@@ -395,11 +403,12 @@ Generated by `create-run`:
 runs/my-run/
 ├── eh_config.yaml          # frozen copy of config
 ├── eh_manifest.json        # task_key → {model_key, label, model_path, display_name, ...}
-├── eh_task_map.json        # suite → [leaf_tasks] (used by collect + submit --check-hf)
+├── eh_task_map.json        # suite → [leaf_tasks] (used by HF sync, status, parallel mode)
+├── eh_hf_covered.json      # task_key → [covered_tasks] (HF skip list, if hf_result_repo set)
 ├── eh_job.slurm            # generated sbatch script
 ├── logs/                   # {model}-{checkpoint}-{jobid}.log (start/finish per task only)
 └── progress/
-    ├── jobs_completed.log  # append-only completion tracking
+    ├── jobs_completed.log  # append-only completion tracking (includes HF-covered jobs)
     └── jobs_failed.log     # failure tracking with reasons
 ```
 
@@ -414,8 +423,8 @@ eval-hive/
 │   ├── create_run.py        # Generate run directory, manifest, sbatch script
 │   ├── prepare.py           # Download datasets, build request caches, pack tarball
 │   ├── validate_config.py   # Validate config and display model/checkpoint table
-│   ├── submit.py            # Submit jobs from manifest with dedup (+ --check-hf)
-│   ├── collect.py           # Collect results into parquet with aggregation (+ --push-to)
+│   ├── submit.py            # Submit jobs from manifest with dedup
+│   ├── collect.py           # Collect results into parquet with aggregation (+ --upload to HF)
 │   ├── status.py            # Monitor run progress
 │   ├── cancel.py            # Cancel active Slurm jobs for a run
 │   ├── load_balancer.py     # Async least-connections reverse proxy

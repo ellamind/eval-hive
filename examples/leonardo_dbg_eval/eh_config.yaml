@@ -5,14 +5,15 @@
 
 # === SLURM Configuration ===
 # Consult your cluster's documentation if you are unsure about the values below.
-job_name: ""
-partition: ""
-account: ""
+job_name: "hplt2c-ref-eval"
+partition: "boost_usr_prod"
+account: "oellm_prod2026"
 # qos: "normal"
-qos: ""
+qos: "boost_qos_dbg"
 cpus_per_node: 32 
 gres_per_node: "gpu:4"
-time_limit: "23:58:00"
+# time_limit: "23:58:00"
+time_limit: "29:00"
 
 # Additional SBATCH arguments (optional)
 additional_sbatch_args:
@@ -20,10 +21,11 @@ additional_sbatch_args:
 
 # === Scaling Configuration ===
 # The total number of nodes will be num_inference_servers * num_nodes_per_inference_server.
-num_inference_servers: 1
+num_inference_servers: 4
 num_nodes_per_inference_server: 1 # Increase this only if your model requires more than 1 node per inference server.
 parallel_tasks: 8  # Max concurrent lm-eval processes per job (one per task). Requires 'prepare' to be run first. 1 = sequential.
 task_batch_size: 8  # Tasks per lm-eval invocation (parallel mode). Larger = less filesystem I/O, but more progress lost on failure.
+
 
 # === Environment Configuration ===
 # Option 1: Use pixi (set pixi_manifest and pixi_env)
@@ -51,6 +53,7 @@ inference_server_command: >-
       --port ${EH_PORT}
       --tensor-parallel-size 4
       --max-num-seqs 512
+      --max_num_batched_tokens 16384
       --max-model-len auto
       --enable-chunked-prefill
       --enable-prefix-caching
@@ -73,7 +76,7 @@ eval:
     model: ${EH_MODEL_PATH}
     tokenizer: ${EH_MODEL_PATH}
     base_url: http://localhost:${EH_PORT}/v1/completions
-    num_concurrent: 4
+    num_concurrent: 32
     max_length: 2048
   # HTTP timeout and retries for lm-eval API requests.
   # Injected into model_args unless already set there.
@@ -83,29 +86,46 @@ eval:
   lm_eval_args:
     model: local-completions
     batch_size: 16
-    log_samples: true
 
 # === Output Configuration ===
-output_path: ""
+output_path: "eval_results/hplt2c_deu"
 request_cache_dir: "lm_eval_requests_cache"  # optional: shared request cache for lm-eval (LM_HARNESS_CACHE_PATH)
 
 # === HuggingFace Results ===
-# Optional: HF dataset repo for result storage (e.g. 'org/eval-scores').
-# When set, model-task-combinations already covered in the repo are skipped,
-# and 'collect --upload' pushes results to it.
-# hf_result_repo: "org/eval-scores"
+hf_result_repo: "ellamind/eval-scores"
 
 models:
-  HPLT2c_eng_main:  # unique config key (YAML dict keys must be unique)
-    model_key: HPLT2c_eng  # shared model key → parquet 'model' column (defaults to config key if omitted)
-    path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_eng_checkpoints/main"
-    display_name: "HPLT2c eng"  # human-friendly name for result display (required)
-    tokens_trained: 100B  # total tokens trained (recommended for non-checkpoint models; supports K, M, B, T suffixes)
+  HPLT2c_deu_main:
+    model_key: HPLT2c_deu
+    path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_deu_checkpoints/main"
+    display_name: "HPLT2c deu"
+    tokens_trained: 100B
 
-  HPLT2c_eng_checkpoints:  # unique config key
-    model_key: HPLT2c_eng  # same model key → same 'model' column, differentiated by step
+  HPLT2c_deu_checkpoints:
+    model_key: HPLT2c_deu
+    path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_deu_checkpoints"
+    checkpoint_pattern: "checkpoint_{step}"
+    steps: [5000, 10000, 20000, 30000, 40000]
+    display_name: "HPLT2c deu"
+    train_batch_size: 2_097_152
+
+  HPLT2c_eng_main:
+    model_key: HPLT2c_eng
+    path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_eng_checkpoints/main"
+    display_name: "HPLT2c eng"
+    tokens_trained: 100B
+
+  HPLT2c_eng_checkpoints:
+    model_key: HPLT2c_eng
     path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_eng_checkpoints"
     checkpoint_pattern: "checkpoint_{step}"
     steps: [5000, 10000, 20000, 30000, 40000]
-    display_name: "HPLT2c eng"  # human-friendly name for result display (required)
-    train_batch_size: 4_194_304  # batch size in tokens (recommended for checkpoint models)
+    display_name: "HPLT2c eng"
+    train_batch_size: 2_097_152
+
+  d01_long:
+    model_key: d01_long
+    path: /leonardo_scratch/large/userexternal/mfromm00/SoofiTraining/hf_exports/d01_long
+    checkpoint_pattern: "iter_{step}"
+    display_name: "D01"
+    train_batch_size: 2_097_152

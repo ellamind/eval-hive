@@ -5,17 +5,15 @@
 
 # === SLURM Configuration ===
 # Consult your cluster's documentation if you are unsure about the values below.
-job_name: "hplt2c-ref-eval"
+job_name: "dataablations-eval"
 partition: "boost_usr_prod"
 account: "oellm_prod2026"
-# qos: "normal"
-qos: "boost_qos_dbg"
+qos: "normal"
+# qos: "boost_qos_dbg"
 cpus_per_node: 32 
 gres_per_node: "gpu:4"
-# time_limit: "23:58:00"
-time_limit: "29:00"
-
-max_concurrent_jobs: 1
+time_limit: "6:00:00"
+# time_limit: "29:00"
 
 # Additional SBATCH arguments (optional)
 additional_sbatch_args:
@@ -23,9 +21,10 @@ additional_sbatch_args:
 
 # === Scaling Configuration ===
 # The total number of nodes will be num_inference_servers * num_nodes_per_inference_server.
-num_inference_servers: 4
+num_inference_servers: 1
 num_nodes_per_inference_server: 1 # Increase this only if your model requires more than 1 node per inference server.
 parallel_tasks: 8  # Max concurrent lm-eval processes per job (one per task). Requires 'prepare' to be run first. 1 = sequential.
+task_batch_size: 8  # Tasks per lm-eval invocation (parallel mode). Larger = less filesystem I/O, but more progress lost on failure.
 
 # === Environment Configuration ===
 # Option 1: Use pixi (set pixi_manifest and pixi_env)
@@ -53,6 +52,7 @@ inference_server_command: >-
       --port ${EH_PORT}
       --tensor-parallel-size 4
       --max-num-seqs 512
+      --max_num_batched_tokens 16384
       --max-model-len auto
       --enable-chunked-prefill
       --enable-prefix-caching
@@ -75,7 +75,7 @@ eval:
     model: ${EH_MODEL_PATH}
     tokenizer: ${EH_MODEL_PATH}
     base_url: http://localhost:${EH_PORT}/v1/completions
-    num_concurrent: 4
+    num_concurrent: 32
     max_length: 2048
   # HTTP timeout and retries for lm-eval API requests.
   # Injected into model_args unless already set there.
@@ -85,44 +85,103 @@ eval:
   lm_eval_args:
     model: local-completions
     batch_size: 16
-    log_samples: true
 
 # === Output Configuration ===
-output_path: "eval_results/hplt2c_deu"
+output_path: "eval_results/datablation_models"
 request_cache_dir: "lm_eval_requests_cache"  # optional: shared request cache for lm-eval (LM_HARNESS_CACHE_PATH)
 
+# === HuggingFace Results ===
+hf_result_repo: "ellamind/eval-scores"
+
 models:
-  HPLT2c_deu_main:
-    model_key: HPLT2c_deu
-    path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_deu_checkpoints/main"
-    display_name: "HPLT2c deu"
-    tokens_trained: 100B
-
-  HPLT2c_deu_checkpoints:
-    model_key: HPLT2c_deu
-    path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_deu_checkpoints"
-    checkpoint_pattern: "checkpoint_{step}"
-    steps: [5000, 10000, 20000, 30000, 40000]
-    display_name: "HPLT2c deu"
-    train_batch_size: 2_097_152
-
-  HPLT2c_eng_main:
-    model_key: HPLT2c_eng
-    path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_eng_checkpoints/main"
-    display_name: "HPLT2c eng"
-    tokens_trained: 100B
-
-  HPLT2c_eng_checkpoints:
-    model_key: HPLT2c_eng
-    path: "/leonardo_work/AIFAC_L01_028/models/HPLT/hplt2c_eng_checkpoints"
-    checkpoint_pattern: "checkpoint_{step}"
-    steps: [5000, 10000, 20000, 30000, 40000]
-    display_name: "HPLT2c eng"
-    train_batch_size: 2_097_152
 
   d01_long:
     model_key: d01_long
-    path: /leonardo_scratch/large/userexternal/mfromm00/SoofiTraining/hf_exports/d01_long
+    path: /leonardo_work/AIFAC_L01_028/models/dataablations/d01_long
     checkpoint_pattern: "iter_{step}"
     display_name: "D01"
+    train_batch_size: 2_097_152
+
+  # d02_long:
+  #   model_key: d02_long
+  #   path: /leonardo_work/AIFAC_L01_028/models/dataablations/d02_long
+  #   checkpoint_pattern: "iter_{step}"
+  #   display_name: "D02"
+  #   train_batch_size: 2_097_152
+
+  d03_long:
+    model_key: d03_long
+    path: /leonardo_work/AIFAC_L01_028/models/dataablations/d03_long
+    checkpoint_pattern: "iter_{step}"
+    display_name: "D03"
+    train_batch_size: 2_097_152
+
+  d04_long:
+    model_key: d04_long
+    path: /leonardo_work/AIFAC_L01_028/models/dataablations/d04_long
+    checkpoint_pattern: "iter_{step}"
+    display_name: "D04"
+    train_batch_size: 2_097_152
+
+  d05_long:
+    model_key: d05_long
+    path: /leonardo_work/AIFAC_L01_028/models/dataablations/d05_long
+    checkpoint_pattern: "iter_{step}"
+    display_name: "D05"
+    train_batch_size: 2_097_152
+
+  d06_long:
+    model_key: d06_long
+    path: /leonardo_work/AIFAC_L01_028/models/dataablations/d06_long
+    checkpoint_pattern: "iter_{step}"
+    display_name: "D06"
+    train_batch_size: 2_097_152
+
+  d07_long:
+    model_key: d07_long
+    path: /leonardo_work/AIFAC_L01_028/models/dataablations/d07_long
+    checkpoint_pattern: "iter_{step}"
+    display_name: "D07"
+    train_batch_size: 2_097_152
+
+  d08_long:
+    model_key: d08_long
+    path: /leonardo_work/AIFAC_L01_028/models/dataablations/d08_long
+    checkpoint_pattern: "iter_{step}"
+    display_name: "D08"
+    train_batch_size: 2_097_152
+
+  d09_long:
+    model_key: d09_long
+    path: /leonardo_work/AIFAC_L01_028/models/dataablations/d09_long
+    checkpoint_pattern: "iter_{step}"
+    display_name: "D09"
+    train_batch_size: 2_097_152
+
+  d10_long:
+    model_key: d10_long
+    path: /leonardo_work/AIFAC_L01_028/models/dataablations/d10_long
+    checkpoint_pattern: "iter_{step}"
+    display_name: "D10"
+    train_batch_size: 2_097_152
+
+  d11_long:
+    model_key: d11_long
+    path: /leonardo_work/AIFAC_L01_028/models/dataablations/d11_long
+    checkpoint_pattern: "iter_{step}"
+    display_name: "D11"
+    train_batch_size: 2_097_152
+
+  d12_long:
+    model_key: d12_long
+    path: /leonardo_work/AIFAC_L01_028/models/dataablations/d12_long
+    checkpoint_pattern: "iter_{step}"
+    display_name: "D12"
+    train_batch_size: 2_097_152
+
+  d13_long:
+    model_key: d13_long
+    path: /leonardo_work/AIFAC_L01_028/models/dataablations/d13_long
+    checkpoint_pattern: "iter_{step}"
+    display_name: "D13"
     train_batch_size: 2_097_152

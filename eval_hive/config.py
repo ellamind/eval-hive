@@ -109,7 +109,7 @@ class ModelEntry(BaseModel):
 
     def _checkpoint_regex(self) -> re.Pattern[str]:
         """Compile checkpoint_pattern into a regex matching directory names."""
-        regex_str = re.escape(self.checkpoint_pattern).replace(r"\{step\}", r"(\d+)")
+        regex_str = re.escape(self.checkpoint_pattern).replace(r"\{step\}", r"(\d+)").replace(r"\*", ".*")
         return re.compile(f"^{regex_str}$")
 
     def resolve_checkpoints(self) -> List[tuple[int, Path]]:
@@ -138,17 +138,17 @@ class ModelEntry(BaseModel):
                             found.append((step, child))
         return sorted(found)
 
-    def resolve_model_paths(self) -> List[tuple[str, Path]]:
-        """Return (label, path) pairs for all models/checkpoints to evaluate.
+    def resolve_model_paths(self) -> List[tuple[str, int | None, Path]]:
+        """Return (label, step, path) triples for all models/checkpoints to evaluate.
 
         Labels use the actual directory name (preserving zero-padding etc.):
-        - Single model → [("main", path)]
-        - Checkpoint series → [("checkpoint_0010000", path), ...]
+        - Single model → [("main", None, path)]
+        - Checkpoint series → [("checkpoint_0010000", 10000, path), ...]
         """
         checkpoints = self.resolve_checkpoints()
         if not checkpoints:
-            return [("main", Path(self.path))]
-        return [(ckpt_path.name, ckpt_path) for _step, ckpt_path in checkpoints]
+            return [("main", None, Path(self.path))]
+        return [(ckpt_path.name, step, ckpt_path) for step, ckpt_path in checkpoints]
 
 
 # lm_eval CLI args that eval-hive constructs per-suite and must not be overridden
@@ -218,11 +218,6 @@ class EhConfig(BaseModel):
         description="Generic resources per node (e.g. 'gpu:4')",
     )
     time_limit: str = Field(..., description="SLURM time limit")
-    max_concurrent_jobs: int = Field(
-        default=4,
-        gt=0,
-        description="Maximum number of concurrent SLURM array jobs",
-    )
     additional_sbatch_args: Optional[Dict[str, str]] = Field(
         default=None, description="Additional SBATCH arguments as key-value pairs"
     )
@@ -240,6 +235,14 @@ class EhConfig(BaseModel):
         description=(
             "Max concurrent lm-eval processes per job (one per task). "
             "1 = sequential (current behavior)."
+        ),
+    )
+    task_batch_size: int = Field(
+        default=8,
+        ge=1,
+        description=(
+            "Number of tasks per lm-eval invocation in parallel mode. "
+            "Larger values reduce filesystem I/O but lose more progress on failure."
         ),
     )
 
@@ -284,6 +287,16 @@ class EhConfig(BaseModel):
     request_cache_dir: Optional[Path] = Field(
         default=None,
         description="Directory for lm-eval request cache (overrides LM_HARNESS_CACHE_PATH). If not set, lm-eval uses its built-in default.",
+    )
+
+    # HuggingFace Results
+    hf_result_repo: Optional[str] = Field(
+        default=None,
+        description=(
+            "HuggingFace dataset repo for result storage (e.g. 'org/eval-scores'). "
+            "When set, 'submit' auto-skips tasks already covered in the repo, "
+            "and 'collect --upload' pushes results to it."
+        ),
     )
 
     # Models

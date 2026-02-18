@@ -37,41 +37,60 @@ def get_failed_tasks(run_dir: Path) -> dict[str, dict]:
     return failed
 
 
-def _has_results(path: Path) -> bool:
-    return path.exists() and any(path.glob("results_*.json"))
+def _collect_completed_tasks(base: Path) -> set[str]:
+    """Scan all result files under *base* to find completed task names.
+
+    Handles both per-task directories (old format) and batch directories
+    (new format) by parsing the ``results`` key from each result file.
+    """
+    completed: set[str] = set()
+    if not base.is_dir():
+        return completed
+    for subdir in base.iterdir():
+        if not subdir.is_dir():
+            continue
+        for rf in subdir.glob("results_*.json"):
+            try:
+                data = json.loads(rf.read_text())
+                completed.update(data.get("results", {}).keys())
+            except (json.JSONDecodeError, OSError):
+                continue
+    return completed
 
 
 def get_task_progress(
-    output_path: Path,
-    model_key: str,
-    label: str,
+    completed: set[str],
     suites_and_tasks: list[str],
     task_map: dict[str, list[str]],
 ) -> dict[str, tuple[int, int]]:
     """Returns {suite_or_task: (done, total)} for each entry in suites_and_tasks."""
-    base = output_path / model_key / label
     result = {}
     for suite in suites_and_tasks:
         tasks = task_map[suite]
-        done = sum(1 for t in tasks if _has_results(base / t))
+        done = sum(1 for t in tasks if t in completed)
         result[suite] = (done, len(tasks))
     return result
 
 
 def get_unique_progress(
-    output_path: Path,
-    model_key: str,
-    label: str,
+    completed: set[str],
     task_map: dict[str, list[str]],
     suites: list[str],
-) -> tuple[int, int]:
-    """Returns (done, total) across all suites, deduplicating shared tasks."""
-    base = output_path / model_key / label
+    hf_tasks: set[str] | None = None,
+) -> tuple[int, int, int]:
+    """Returns (local, hf_only, total) across all suites, deduplicating shared tasks."""
     all_tasks = set()
     for s in suites:
         all_tasks.update(task_map.get(s, []))
-    done = sum(1 for t in all_tasks if _has_results(base / t))
-    return done, len(all_tasks)
+    hf_tasks = hf_tasks or set()
+    local = 0
+    hf_only = 0
+    for t in all_tasks:
+        if t in completed:
+            local += 1
+        elif t in hf_tasks:
+            hf_only += 1
+    return local, hf_only, len(all_tasks)
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -115,6 +134,10 @@ def run(args: argparse.Namespace) -> int:
         all_unique.update(task_map.get(s, []))
     unique_total = len(all_unique)
 
+    # Load HF coverage
+    hf_covered_path = run_dir / "eh_hf_covered.json"
+    hf_covered = json.loads(hf_covered_path.read_text()) if hf_covered_path.exists() else {}
+
     # Gather state
     completed = get_completed_tasks(run_dir)
     failed = get_failed_tasks(run_dir)
@@ -134,17 +157,35 @@ def run(args: argparse.Namespace) -> int:
 
     # Compute per-manifest-key state
     counts = {"completed": 0, "running": 0, "pending": 0, "failed": 0, "not_started": 0}
+    sum_local = 0
+    sum_hf = 0
+    sum_total = 0
     rows = []
+
+    # Cache completed tasks per (model_key, label) to avoid re-parsing
+    _completed_cache: dict[tuple[str, str], set[str]] = {}
 
     for task_key, entry in manifest.items():
         model_key = entry["model_key"]
         label = entry["label"]
 
+        cache_key = (model_key, label)
+        if cache_key not in _completed_cache:
+            base = output_path / model_key / label
+            _completed_cache[cache_key] = _collect_completed_tasks(base)
+        disk_completed = _completed_cache[cache_key]
+
         # Per-suite progress
-        suite_progress = get_task_progress(output_path, model_key, label, suites_and_tasks, task_map)
+        suite_progress = get_task_progress(disk_completed, suites_and_tasks, task_map)
         # Deduplicated overall progress
-        done, total = get_unique_progress(output_path, model_key, label, task_map, suites_and_tasks)
-        all_done = done == total
+        hf_tasks = set(hf_covered.get(task_key, []))
+        local, hf_only, total = get_unique_progress(
+            disk_completed, task_map, suites_and_tasks, hf_tasks,
+        )
+        sum_local += local
+        sum_hf += hf_only
+        sum_total += total
+        all_done = (local + hf_only) == total
 
         # Determine state
         if task_key in completed or all_done:
@@ -158,7 +199,6 @@ def run(args: argparse.Namespace) -> int:
             state = "not_started"
 
         counts[state] += 1
-        progress_str = f"{done}/{total}"
 
         # SLURM info
         slurm_str = ""
@@ -171,26 +211,30 @@ def run(args: argparse.Namespace) -> int:
         if state == "failed":
             fail_str = failed[task_key]["reason"]
 
+        progress_str = f"{local} / {hf_only} / {total}"
         rows.append([task_key, state, progress_str, slurm_str or fail_str])
 
         if args.detailed:
             for suite in suites_and_tasks:
                 s_done, s_total = suite_progress.get(suite, (0, 0))
-                rows.append(["  \u2514 " + suite, "", f"{s_done}/{s_total}", ""])
+                rows.append(["  \u2514 " + suite, "", f"{s_done} / {s_total}", ""])
 
     print(tabulate(
         rows,
-        headers=["Task Key", "Status", "Progress", "Info"],
+        headers=["Task Key", "Status", "Progress (local/HF/total)", "Info"],
         tablefmt="rounded_outline",
     ))
 
     # Summary
     print()
+    sum_done = sum_local + sum_hf
+    pct = (sum_done / sum_total * 100) if sum_total else 0
+    print(f"Progress: {sum_local} local / {sum_hf} HF / {sum_total} total ({pct:.0f}%)")
     parts = []
     for label_name, key in [("completed", "completed"), ("running", "running"),
                              ("pending", "pending"), ("failed", "failed"),
                              ("not started", "not_started")]:
         if counts[key] > 0:
             parts.append(f"{counts[key]} {label_name}")
-    print(f"Total: {', '.join(parts)}" if parts else "Total: no tasks in manifest")
+    print(f"Jobs: {', '.join(parts)}" if parts else "Jobs: no tasks in manifest")
     return 0

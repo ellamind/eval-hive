@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,29 +11,6 @@ import polars as pl
 from loguru import logger
 
 from eval_hive.config import load_config
-
-
-# ── Step extraction ───────────────────────────────────────────────────────────
-
-
-def parse_step_from_label(label: str) -> int | None:
-    """Extract training step from an eval-hive label.
-
-    Returns the integer value of the last digit sequence in the label,
-    or None if the label contains no digits (e.g., ``"main"``).
-
-    Examples::
-
-        >>> parse_step_from_label("checkpoint_0005000")
-        5000
-        >>> parse_step_from_label("main")
-        >>> parse_step_from_label("v2_checkpoint_0005000")
-        5000
-    """
-    matches = re.findall(r"\d+", label)
-    if not matches:
-        return None
-    return int(matches[-1])
 
 
 # ── Result discovery ──────────────────────────────────────────────────────────
@@ -58,6 +34,7 @@ class DiscoveredResult:
 def discover_results(
     output_path: Path,
     manifest: dict[str, dict],
+    hf_covered_keys: set[str] | None = None,
 ) -> list[DiscoveredResult]:
     """Walk the output directory to find result files for all manifest entries.
 
@@ -74,11 +51,12 @@ def discover_results(
         display_name = entry.get("display_name")
         train_batch_size = entry.get("train_batch_size")
         tokens_trained = entry.get("tokens_trained")
-        step = parse_step_from_label(label)
+        step = entry.get("step")
 
         base = output_path / model_key / label
         if not base.is_dir():
-            logger.debug("No output directory for %s: %s", mkey, base)
+            if not (hf_covered_keys and mkey in hf_covered_keys):
+                logger.debug("No output directory for {}: {}", mkey, base)
             continue
 
         for task_dir in sorted(base.iterdir()):
@@ -130,13 +108,17 @@ def collect_from_run(
     config = load_config(run_dir / "eh_config.yaml")
     output_path = config.output_path
 
-    logger.info("Run directory: %s", run_dir)
-    logger.info("Output path:   %s", output_path)
-    logger.info("Manifest:      %d entries", len(manifest))
+    logger.info("Run directory: {}", run_dir)
+    logger.info("Output path:   {}", output_path)
+    logger.info("Manifest:      {} entries", len(manifest))
+
+    # Load HF coverage to suppress warnings for entries fully covered by HF
+    hf_covered_path = run_dir / "eh_hf_covered.json"
+    hf_covered_keys = set(json.loads(hf_covered_path.read_text()).keys()) if hf_covered_path.exists() else None
 
     # Discover results
-    discovered = discover_results(output_path, manifest)
-    logger.info("Discovered %d result files", len(discovered))
+    discovered = discover_results(output_path, manifest, hf_covered_keys)
+    logger.info("Discovered {} result files", len(discovered))
 
     # Parse results
     all_rows: list[dict] = []
@@ -158,10 +140,10 @@ def collect_from_run(
             all_rows.extend(r.model_dump() for r in rows)
         except Exception:
             n_errors += 1
-            logger.warning("Failed to parse %s", dr.result_path, exc_info=True)
+            logger.opt(exception=True).warning("Failed to parse {}", dr.result_path)
 
     if n_errors:
-        logger.warning("%d files failed to parse", n_errors)
+        logger.warning("{} files failed to parse", n_errors)
 
     if not all_rows:
         logger.warning("No results found to collect")
@@ -169,45 +151,42 @@ def collect_from_run(
         df.write_parquet(output_parquet)
         return df
 
-    leaf_df = pl.DataFrame(all_rows)
+    # Pre-serialize subtask_tree dicts to JSON strings BEFORE creating the
+    # DataFrame.  Polars infers a Struct schema from the first non-null dict
+    # it encounters, silently dropping keys that don't match that schema.
+    # Storing as plain strings avoids this corruption.
+    for row in all_rows:
+        if row.get("subtask_tree") is not None:
+            row["subtask_tree"] = json.dumps(row["subtask_tree"])
 
-    # Serialize subtask_tree (nested dicts from model_dump) to JSON strings
-    if "subtask_tree" in leaf_df.columns:
-        leaf_df = leaf_df.with_columns(
-            pl.col("subtask_tree").map_elements(
-                lambda v: json.dumps(v) if v is not None else None,
-                return_dtype=pl.String,
-            )
-        )
+    leaf_df = pl.DataFrame(all_rows, infer_schema_length=None)
 
     # Aggregate group/suite scores from YAML hierarchy
     task_dirs = _resolve_task_dirs(config)
     if task_dirs:
         # Filter to benchmark rows for aggregation input
         benchmarks = leaf_df.filter(pl.col("task_type") == "benchmark")
-        # Deserialize subtask_tree back for aggregation (it needs dicts)
-        if "subtask_tree" in benchmarks.columns:
-            benchmarks = benchmarks.with_columns(
-                pl.col("subtask_tree").map_elements(
-                    lambda v: json.loads(v) if isinstance(v, str) else v,
-                    return_dtype=pl.Object,
-                )
-            )
         agg_df = aggregate_scores(
             benchmarks,
             task_dirs,
             config.eval.suites_and_tasks,
         )
         if len(agg_df) > 0:
-            # Serialize subtask_tree in aggregate rows
-            if "subtask_tree" in agg_df.columns:
-                agg_df = agg_df.with_columns(
-                    pl.col("subtask_tree").map_elements(
-                        lambda v: json.dumps(v) if v is not None else None,
-                        return_dtype=pl.String,
-                    )
-                )
             leaf_df = pl.concat([leaf_df, agg_df], how="diagonal_relaxed")
+
+    # Reclassify: configured suites that were parsed as task_group → eval_suite.
+    # This fixes misclassification when lm-eval wraps suites in an implicit
+    # root group (making them appear as children in group_subtasks).
+    suite_names = set(config.eval.suites_and_tasks)
+    if suite_names and "task" in leaf_df.columns and "task_type" in leaf_df.columns:
+        leaf_df = leaf_df.with_columns(
+            pl.when(
+                pl.col("task").is_in(suite_names) & (pl.col("task_type") == "task_group")
+            )
+            .then(pl.lit("eval_suite"))
+            .otherwise(pl.col("task_type"))
+            .alias("task_type")
+        )
 
     # Deterministic sort
     sort_cols = [c for c in ["model", "step", "task", "metric", "metric_filter"] if c in leaf_df.columns]
@@ -215,7 +194,7 @@ def collect_from_run(
         leaf_df = leaf_df.sort(sort_cols, nulls_last=False)
 
     leaf_df.write_parquet(output_parquet)
-    logger.info("Wrote %d rows to %s", len(leaf_df), output_parquet)
+    logger.info("Wrote {} rows to {}", len(leaf_df), output_parquet)
 
     return leaf_df
 
@@ -253,11 +232,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="Output parquet file (default: <run_dir>/scores.parquet)",
     )
     parser.add_argument(
-        "--push-to",
-        type=str,
+        "--upload",
+        nargs="?",
+        const=True,
         default=None,
         metavar="HF_REPO",
-        help="HuggingFace dataset repo to push results to (e.g. 'ellamind/eval-scores')",
+        help="Push results to HuggingFace. Uses hf_result_repo from config, "
+             "or specify a repo to override (e.g. --upload org/other-scores)",
     )
 
 
@@ -268,7 +249,7 @@ def run(args: argparse.Namespace) -> int:
 
     for required in ("eh_manifest.json", "eh_config.yaml"):
         if not (run_dir / required).exists():
-            logger.error("Required file not found: %s", run_dir / required)
+            logger.error("Required file not found: {}", run_dir / required)
             return 1
 
     df = collect_from_run(run_dir, output)
@@ -276,9 +257,17 @@ def run(args: argparse.Namespace) -> int:
     if len(df) == 0:
         return 0
 
-    if args.push_to:
+    if args.upload is not None:
+        if isinstance(args.upload, str):
+            hf_repo = args.upload
+        else:
+            config = load_config(run_dir / "eh_config.yaml")
+            if not config.hf_result_repo:
+                logger.error("--upload requires 'hf_result_repo' to be set in the config")
+                return 1
+            hf_repo = config.hf_result_repo
         from eval_hive.results.hf import push_to_hf
 
-        push_to_hf(output, args.push_to)
+        push_to_hf(output, hf_repo)
 
     return 0

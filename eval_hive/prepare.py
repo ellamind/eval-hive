@@ -380,7 +380,7 @@ def run(args: argparse.Namespace) -> int:
         tokenizer_paths = []
         seen_tok = set()
         for model_key, entry in config.models.items():
-            for label, model_path in entry.resolve_model_paths():
+            for label, _step, model_path in entry.resolve_model_paths():
                 tok_path = str(model_path)
                 if tok_path not in seen_tok:
                     seen_tok.add(tok_path)

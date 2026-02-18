@@ -5,7 +5,6 @@ import time
 from collections import Counter
 from pathlib import Path
 
-import polars as pl
 from loguru import logger
 
 from eval_hive.config import load_config
@@ -73,83 +72,20 @@ def get_active_jobs(job_name: str) -> list[dict]:
     return active
 
 
-def _load_scores_parquet(source: str) -> pl.DataFrame | None:
-    """Load a scores parquet from a local path or HF repo.
-
-    If *source* points to an existing local file, reads it directly.
-    Otherwise treats it as a HuggingFace dataset repo ID.
-    """
-    if Path(source).is_file():
-        logger.info(f"Loading local parquet: {source}")
-        return pl.read_parquet(source)
-
-    from eval_hive.results.hf import download_hf_parquet
-
-    return download_hf_parquet(source)
-
-
-def get_hf_covered_keys(
-    source: str,
-    manifest: dict[str, dict],
-    task_map: dict[str, list[str]],
-    suites: list[str],
-) -> set[str]:
-    """Determine which manifest keys have all their tasks covered in existing data.
-
-    *source* can be a local parquet path or a HuggingFace dataset repo ID.
-    Downloads/reads the parquet once and checks each manifest key's expected
-    leaf tasks against the data.
-    """
-    from eval_hive.collect import parse_step_from_label
-
-    df = _load_scores_parquet(source)
-    if df is None or len(df) == 0:
-        logger.info("No existing score data available for dedup")
-        return set()
-
-    # Build lookup set of (model, step, task) tuples
-    hf_tuples: set[tuple[str, int | None, str]] = set()
-    for row in df.select("model", "step", "task").unique().iter_rows(named=True):
-        step = None if row["step"] is None else int(row["step"])
-        hf_tuples.add((row["model"], step, row["task"]))
-
-    logger.info(f"HF data: {len(hf_tuples)} unique (model, step, task) tuples")
-
-    # Collect all expected leaf tasks across all suites
-    all_expected_tasks: set[str] = set()
-    for suite in suites:
-        all_expected_tasks.update(task_map.get(suite, []))
-
-    covered_keys: set[str] = set()
-
-    for mkey, entry in manifest.items():
-        model_key = entry["model_key"]
-        label = entry["label"]
-        step = parse_step_from_label(label)
-
-        # Check if ALL expected leaf tasks are present for this (model, step)
-        if all((model_key, step, task) in hf_tuples for task in all_expected_tasks):
-            covered_keys.add(mkey)
-
-    if covered_keys:
-        logger.info(f"HF dedup: {len(covered_keys)} manifest keys fully covered")
-
-    return covered_keys
-
-
 def get_tasks_to_submit(
     manifest: dict,
     run_dir: Path,
     job_name: str,
-    hf_covered: set[str] | None = None,
+    output_path: Path | None = None,
+    suites: list[str] | None = None,
 ) -> list[str]:
     """Determine which manifest keys still need submission."""
+    from tabulate import tabulate
+
     all_keys = list(manifest.keys())
 
-    # Check completed
+    # Check completed (includes keys marked by HF sync in create-run)
     completed = get_completed_tasks(run_dir)
-    if completed:
-        logger.info(f"Tasks completed: {len(completed)}")
 
     # Check queue
     try:
@@ -158,27 +94,60 @@ def get_tasks_to_submit(
         logger.error(f"Error checking SLURM queue: {e}")
         raise
 
-    if active:
-        active.sort(key=lambda j: j["task_key"])
-        state_counts = Counter(j["state"] for j in active)
-        logger.info(f"Found {len(active)} active jobs for {job_name}")
-        for state, count in sorted(state_counts.items()):
-            logger.info(f"    {count}/{len(active)} {state}")
-    else:
-        logger.info(f"No active jobs found for {job_name}")
-
     in_queue = {j["task_key"] for j in active}
 
-    # HF coverage (third filter layer)
-    if hf_covered:
-        logger.info(f"Tasks covered in HF dataset: {len(hf_covered)}")
-
-    return [
+    to_submit = [
         key for key in all_keys
         if key not in completed
         and key not in in_queue
-        and (hf_covered is None or key not in hf_covered)
     ]
+
+    # Task-level coverage
+    task_line = ""
+    if output_path and suites:
+        task_map_path = run_dir / "eh_task_map.json"
+        if task_map_path.exists():
+            from eval_hive.create_run import count_task_coverage
+
+            task_map = json.loads(task_map_path.read_text())
+            hf_covered_path = run_dir / "eh_hf_covered.json"
+            hf_covered = json.loads(hf_covered_path.read_text()) if hf_covered_path.exists() else None
+
+            all_tasks: set[str] = set()
+            for s in suites:
+                all_tasks.update(task_map.get(s, []))
+
+            total, n_disk, n_hf_only, _, _ = count_task_coverage(
+                output_path, manifest, all_tasks, hf_covered,
+            )
+            n_remaining = total - n_disk - n_hf_only
+            parts = []
+            if n_disk:
+                parts.append(f"{n_disk} on disk")
+            if n_hf_only:
+                parts.append(f"{n_hf_only} on HF")
+            task_line = f"{n_remaining}/{total} remaining"
+            if parts:
+                task_line += f"  ({', '.join(parts)})"
+
+    # Status summary table
+    rows = [
+        ["Total", f"{len(all_keys)} jobs"],
+        ["Completed", f"{len(completed)} jobs"],
+    ]
+    if active:
+        state_counts = Counter(j["state"] for j in active)
+        detail = ", ".join(f"{c} {s.lower()}" for s, c in sorted(state_counts.items()))
+        rows.append(["In queue", f"{len(in_queue)} jobs  ({detail})"])
+    else:
+        rows.append(["In queue", "0 jobs"])
+    rows.append(["To submit", f"{len(to_submit)} jobs"])
+    if task_line:
+        rows.append(["Tasks", task_line])
+
+    print(tabulate(rows, tablefmt="rounded_outline"))
+
+    return to_submit
 
 
 # ── Submission ────────────────────────────────────────────────
@@ -190,9 +159,9 @@ def submit_tasks(
     job_script: Path,
 ) -> tuple[int, list[str]]:
     """Submit tasks via sbatch. Returns (submitted_count, remaining_tasks)."""
+    total = len(tasks_to_submit)
     submitted = 0
     for i, task_key in enumerate(tasks_to_submit):
-        logger.info(f"  {i + 1}/{len(tasks_to_submit)}: Submitting job for {task_key}...")
         cmd = [
             "sbatch",
             f"--export=ALL,EH_TASK_KEY={task_key}",
@@ -201,16 +170,15 @@ def submit_tasks(
         ]
         try:
             result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            logger.info(f"    {result.stdout.strip()}")
             submitted += 1
+            job_id = result.stdout.strip().split()[-1] if result.stdout.strip() else "?"
+            logger.info(f"  [{submitted}/{total}] {task_key} -> job {job_id}")
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr or e.stdout or ""
             if "QOSMaxSubmitJobPerUserLimit" in error_msg or "Job violates accounting/QOS policy" in error_msg:
-                logger.warning(
-                    f"QOS limit reached after submitting {submitted} jobs. "
-                    f"Remaining: {len(tasks_to_submit) - i}"
-                )
-                return submitted, tasks_to_submit[i:]
+                remaining = tasks_to_submit[i:]
+                logger.warning(f"QOS limit reached. Submitted {submitted}/{total}, {len(remaining)} remaining.")
+                return submitted, remaining
             else:
                 logger.error(f"sbatch failed for {task_key}: {error_msg}")
                 raise RuntimeError(f"sbatch failed: {error_msg}") from e
@@ -243,12 +211,6 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--max-retries", type=int, default=None,
         help="Maximum number of retry cycles (default: unlimited)",
     )
-    parser.add_argument(
-        "--check-hf", type=str, default=None,
-        metavar="SOURCE",
-        help="Skip manifest keys whose tasks are already covered. "
-             "SOURCE can be a local parquet file or a HuggingFace dataset repo ID.",
-    )
 
 
 def run(args: argparse.Namespace) -> int:
@@ -261,25 +223,6 @@ def run(args: argparse.Namespace) -> int:
         logger.error(f"Job script not found: {job_script}")
         return 1
 
-    # HF dedup: compute once before the retry loop
-    hf_covered: set[str] | None = None
-    if args.check_hf:
-        task_map_path = args.run_dir / "eh_task_map.json"
-        if task_map_path.exists():
-            task_map = json.loads(task_map_path.read_text())
-            hf_covered = get_hf_covered_keys(
-                args.check_hf,
-                manifest,
-                task_map,
-                config.eval.suites_and_tasks,
-            )
-        else:
-            logger.warning(
-                "Task map not found at %s. Skipping HF dedup. "
-                "Re-run create-run to generate it.",
-                task_map_path,
-            )
-
     retry_count = 0
 
     while True:
@@ -287,33 +230,34 @@ def run(args: argparse.Namespace) -> int:
             logger.info(f"=== Retry cycle {retry_count} ===")
 
         tasks_to_submit = get_tasks_to_submit(
-            manifest, args.run_dir, config.job_name, hf_covered
+            manifest, args.run_dir, config.job_name,
+            output_path=config.output_path,
+            suites=config.eval.suites_and_tasks,
         )
-        logger.info(f"Tasks to submit: {len(tasks_to_submit)}")
 
         if not tasks_to_submit:
-            logger.info("No tasks to submit. All are either completed or in queue.")
+            logger.info("Nothing to submit.")
             return 0
 
         if args.limit:
-            logger.warning(f"Applying limit of {args.limit} per cycle.")
             tasks_to_submit = tasks_to_submit[:args.limit]
+            logger.info(f"Limited to {args.limit} jobs per cycle.")
 
         if args.dry:
-            logger.info("Dry run — would submit the following tasks:")
+            logger.info("Dry run — would submit:")
             for task_key in tasks_to_submit:
                 entry = manifest[task_key]
                 logger.info(f"  {task_key}: {entry['model_key']}/{entry['label']}")
             return 0
-
-        logger.info(f"Submitting {len(tasks_to_submit)} jobs...")
         submitted, remaining = submit_tasks(tasks_to_submit, config.job_name, job_script)
 
         if not remaining:
             logger.info(f"Done. Submitted {submitted} jobs.")
             if args.retry_interval:
                 tasks_to_submit = get_tasks_to_submit(
-                    manifest, args.run_dir, config.job_name, hf_covered
+                    manifest, args.run_dir, config.job_name,
+                    output_path=config.output_path,
+                    suites=config.eval.suites_and_tasks,
                 )
                 if not tasks_to_submit:
                     logger.info("All tasks submitted or in queue. Exiting.")
