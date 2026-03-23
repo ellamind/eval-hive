@@ -64,8 +64,8 @@ class TaskConfig(BaseModel):
         None, description='HuggingFace dataset subset name, e.g. "ARC-Challenge"'
     )
     repeats: Optional[int] = Field(None, description="Number of repeats per sample")
-    doc_to_text: Optional[str] = Field(None, description="Jinja template for prompt")
-    doc_to_target: Optional[str] = Field(None, description="Jinja template for target")
+    doc_to_text: Optional[str] = Field(None, description="Jinja template or literal for prompt")
+    doc_to_target: Optional[str] = Field(None, description="Jinja template or literal for target")
     doc_to_choice: Optional[str] = Field(
         None, description="Jinja template or literal list for choices (serialized as string)"
     )

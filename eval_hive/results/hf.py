@@ -66,6 +66,13 @@ def merge_and_dedup(
     When duplicates exist, keep the row with the latest ``eval_date``.
     """
     combined = pl.concat([existing_df, new_df], how="diagonal_relaxed")
+
+    # diagonal_relaxed may upcast nullable Int64 → Float64; cast back to Int64
+    # so that large token counts don't suffer floating-point precision loss.
+    for col in ("tokens_trained", "train_batch_size"):
+        if col in combined.columns and combined[col].dtype != pl.Int64:
+            combined = combined.with_columns(pl.col(col).round(0).cast(pl.Int64))
+
     before = len(combined)
 
     combined = (

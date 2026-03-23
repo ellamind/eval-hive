@@ -196,16 +196,21 @@ def aggregate_scores(
     # Unique (model, step) combos
     model_steps = leaf_df.select("model", "step").unique().rows()
 
-    # Pre-compute which metrics each task can report.
-    # Groups: from their aggregate_metric_list.
-    # Leaves: from the metrics actually present in the scores data.
+    # Pre-compute which metrics each task can report, and the metric_filter
+    # it uses for each metric.  Most tasks use "none" but code-execution
+    # benchmarks use filters like "create_test" or "build_test".
     task_reported_metrics: dict[str, set[str]] = {}
+    # (task, metric) → preferred metric_filter (first seen; "none" wins)
+    task_metric_filter: dict[tuple[str, str], str] = {}
     for gname, ginfo in hierarchy.items():
         task_reported_metrics[gname] = {am.metric for am in ginfo.aggregate_metrics}
-    for _, _, tname, mname, _ in scores:
+    for _, _, tname, mname, mfilter in scores:
         if tname not in task_reported_metrics:
             task_reported_metrics[tname] = set()
         task_reported_metrics[tname].add(mname)
+        key = (tname, mname)
+        if key not in task_metric_filter or mfilter == "none":
+            task_metric_filter[key] = mfilter
 
     suite_set = set(suites)
     aggregate_rows: list[dict] = []
@@ -229,8 +234,6 @@ def aggregate_scores(
         for model, step_val in model_steps:
             for agg_metric in group.aggregate_metrics:
                 metric_name = agg_metric.metric
-                # Default filter — most metrics use "none"
-                metric_filter = "none"
 
                 # Only children that can report this metric are applicable.
                 applicable_children = [
@@ -246,7 +249,13 @@ def aggregate_scores(
                 subtask_children: list[str] = []
 
                 for child_name in applicable_children:
-                    child_key = (model, step_val, child_name, metric_name, metric_filter)
+                    # Use the filter the child actually reports for this
+                    # metric (e.g. "create_test" for humaneval pass@1)
+                    # rather than assuming "none".
+                    child_filter = task_metric_filter.get(
+                        (child_name, metric_name), "none"
+                    )
+                    child_key = (model, step_val, child_name, metric_name, child_filter)
                     child_row = scores.get(child_key)
                     if child_row is None or child_row.get("score") is None:
                         continue
@@ -282,7 +291,10 @@ def aggregate_scores(
                 child_tokens_trained: int | None = None
 
                 for child_name in subtask_children:
-                    child_key = (model, step_val, child_name, metric_name, metric_filter)
+                    child_filter = task_metric_filter.get(
+                        (child_name, metric_name), "none"
+                    )
+                    child_key = (model, step_val, child_name, metric_name, child_filter)
                     child_row = scores.get(child_key)
                     if child_row is None:
                         continue
@@ -332,7 +344,7 @@ def aggregate_scores(
                     "step": step_val,
                     "task": group_name,
                     "metric": metric_name,
-                    "metric_filter": metric_filter,
+                    "metric_filter": "none",
                     "score": score,
                     "score_stderr": None,
                     "task_type": task_type,
@@ -356,7 +368,7 @@ def aggregate_scores(
                 }
 
                 # Store so parent groups can use this score
-                result_key = (model, step_val, group_name, metric_name, metric_filter)
+                result_key = (model, step_val, group_name, metric_name, "none")
                 scores[result_key] = row_dict
 
                 aggregate_rows.append(row_dict)

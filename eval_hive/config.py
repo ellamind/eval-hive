@@ -26,7 +26,7 @@ def _parse_human_int(value) -> int | None:
     suffixes = {"K": 10**3, "M": 10**6, "B": 10**9, "T": 10**12}
     upper = s[-1].upper()
     if upper in suffixes:
-        return int(float(s[:-1]) * suffixes[upper])
+        return round(float(s[:-1]) * suffixes[upper])
     return int(s)
 
 
@@ -65,18 +65,30 @@ class ModelEntry(BaseModel):
             "Used to compute tokens_trained = train_batch_size * step."
         ),
     )
-    tokens_trained: Optional[int] = Field(
+    tokens_trained: Optional[int | List[int]] = Field(
         default=None,
         description=(
-            "Total tokens trained (e.g. 100000000000 or '100B'). "
-            "Recommended for non-checkpoint models. "
-            "For checkpoints, derived from train_batch_size * step."
+            "Total tokens trained. Either a single value (e.g. 100000000000 or '100B') "
+            "or a list of values matching 'steps' (one per checkpoint). "
+            "Recommended for non-checkpoint models as a single value. "
+            "For checkpoints, derived from train_batch_size * step when not provided."
+        ),
+    )
+    step_offset: int = Field(
+        default=0,
+        description=(
+            "Offset added to each step in the output (manifest, parquet). "
+            "Checkpoint resolution still uses the original step from the directory name. "
+            "Useful for multi-stage training where the step counter resets but you want "
+            "cumulative steps in the results."
         ),
     )
 
     @field_validator("tokens_trained", mode="before")
     @classmethod
     def parse_human_readable_int(cls, v):
+        if isinstance(v, list):
+            return [_parse_human_int(x) for x in v]
         return _parse_human_int(v)
 
     @model_validator(mode="after")
@@ -87,16 +99,26 @@ class ModelEntry(BaseModel):
             )
         if self.steps is not None and len(self.steps) == 0:
             raise ValueError("'steps' must not be empty when provided")
+        if isinstance(self.tokens_trained, list):
+            if self.steps is None:
+                raise ValueError(
+                    "'tokens_trained' as a list requires 'steps' to be set"
+                )
+            if len(self.tokens_trained) != len(self.steps):
+                raise ValueError(
+                    f"'tokens_trained' list length ({len(self.tokens_trained)}) "
+                    f"must match 'steps' length ({len(self.steps)})"
+                )
         return self
 
     @model_validator(mode="after")
     def warn_training_metadata(self):
         import warnings
         is_checkpoint = self.checkpoint_pattern is not None
-        if is_checkpoint and self.train_batch_size is None:
+        if is_checkpoint and self.train_batch_size is None and self.tokens_trained is None:
             warnings.warn(
-                f"Model '{self.display_name}': 'train_batch_size' is recommended "
-                f"for checkpoint models (needed to compute tokens_trained per step)",
+                f"Model '{self.display_name}': 'train_batch_size' or 'tokens_trained' list "
+                f"is recommended for checkpoint models",
                 stacklevel=2,
             )
         if not is_checkpoint and self.tokens_trained is None:
@@ -147,6 +169,11 @@ class ModelEntry(BaseModel):
         """
         checkpoints = self.resolve_checkpoints()
         if not checkpoints:
+            if self.checkpoint_pattern is not None:
+                raise FileNotFoundError(
+                    f"Model '{self.display_name}': no checkpoints matching "
+                    f"'{self.checkpoint_pattern}' found under '{self.path}'."
+                )
             return [("main", None, Path(self.path))]
         return [(ckpt_path.name, step, ckpt_path) for step, ckpt_path in checkpoints]
 

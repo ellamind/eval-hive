@@ -229,7 +229,13 @@ def run(args: argparse.Namespace) -> int:
     print()
     sum_done = sum_local + sum_hf
     pct = (sum_done / sum_total * 100) if sum_total else 0
-    print(f"Progress: {sum_local} local / {sum_hf} HF / {sum_total} total ({pct:.0f}%)")
+    parts_detail = []
+    if sum_local:
+        parts_detail.append(f"{sum_local} on disk")
+    if sum_hf:
+        parts_detail.append(f"{sum_hf} on HF")
+    detail_str = f"  ({', '.join(parts_detail)})" if parts_detail else ""
+    print(f"Tasks: {sum_done}/{sum_total} done, {sum_total - sum_done} remaining{detail_str}  ({pct:.0f}%)")
     parts = []
     for label_name, key in [("completed", "completed"), ("running", "running"),
                              ("pending", "pending"), ("failed", "failed"),

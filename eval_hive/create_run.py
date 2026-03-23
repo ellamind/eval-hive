@@ -44,15 +44,21 @@ def build_manifest(config: EhConfig) -> dict[str, dict]:
                     f"model_key='{effective_model_key}', label='{label}'. "
                     f"Ensure model_key + label combinations are unique."
                 )
-            tokens_trained = entry.tokens_trained
+            if isinstance(entry.tokens_trained, list):
+                # Per-step tokens_trained list — look up by step index
+                step_idx = entry.steps.index(step) if step is not None and entry.steps else None
+                tokens_trained = entry.tokens_trained[step_idx] if step_idx is not None else None
+            else:
+                tokens_trained = entry.tokens_trained
             if tokens_trained is None and entry.train_batch_size is not None:
                 if step is not None:
                     tokens_trained = entry.train_batch_size * step
 
+            effective_step = step + entry.step_offset if step is not None else None
             manifest[key] = {
                 "model_key": effective_model_key,
                 "label": label,
-                "step": step,
+                "step": effective_step,
                 "model_path": str(path),
                 "display_name": entry.display_name,
                 "train_batch_size": entry.train_batch_size,
@@ -583,6 +589,10 @@ shutdown_servers() {{
             kill -KILL -$SERVER_PID 2>/dev/null || kill -KILL $SERVER_PID 2>/dev/null
         fi
     fi
+    # Kill any remaining vllm/singularity processes that survived signal-based shutdown
+    # (e.g. container processes started via setsid srun that ignore parent signals)
+    pkill -KILL -f "vllm serve.*${{EH_PORT}}" 2>/dev/null || true
+    pkill -KILL -f "singularity exec.*${{EH_PORT}}" 2>/dev/null || true
 }}
 """
 
@@ -990,6 +1000,7 @@ run_task_batch() {{
 
 # Worker pool with manual PID tracking.
 declare -a BATCH_PIDS=()
+declare -A PID_TO_BATCH=()
 
 for (( b=0; b < ${{#BATCHES[@]}}; b++ )); do
     # If at capacity, wait for a slot to free up
@@ -999,7 +1010,11 @@ for (( b=0; b < ${{#BATCHES[@]}}; b++ )); do
             if kill -0 "$pid" 2>/dev/null; then
                 STILL_RUNNING+=("$pid")
             else
-                wait "$pid" || EVAL_FAILURES=$((EVAL_FAILURES + 1))
+                wait "$pid" || {{
+                    EVAL_FAILURES=$((EVAL_FAILURES + 1))
+                    log "ERROR" "[batch ${{PID_TO_BATCH[$pid]}}] Failed (pid $pid)"
+                }}
+                unset PID_TO_BATCH[$pid]
             fi
         done
         BATCH_PIDS=("${{STILL_RUNNING[@]}}")
@@ -1009,11 +1024,15 @@ for (( b=0; b < ${{#BATCHES[@]}}; b++ )); do
     done
     run_task_batch "$b" "${{BATCHES[$b]}}" &
     BATCH_PIDS+=($!)
+    PID_TO_BATCH[$!]=$b
 done
 
 # Wait for all remaining batches
 for pid in "${{BATCH_PIDS[@]}}"; do
-    wait "$pid" || EVAL_FAILURES=$((EVAL_FAILURES + 1))
+    wait "$pid" || {{
+        EVAL_FAILURES=$((EVAL_FAILURES + 1))
+        log "ERROR" "[batch ${{PID_TO_BATCH[$pid]}}] Failed (pid $pid)"
+    }}
 done
 """
 

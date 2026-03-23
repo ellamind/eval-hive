@@ -5,14 +5,15 @@
 
 # === SLURM Configuration ===
 # Consult your cluster's documentation if you are unsure about the values below.
-job_name: ""
-partition: ""
-account: ""
-# qos: "normal"
-qos: ""
+job_name: "eval"
+partition: "boost_usr_prod"
+account: "oellm_prod2026"
+# qos: "boost_qos_dbg"
+qos: "normal"
 cpus_per_node: 32 
 gres_per_node: "gpu:4"
-time_limit: "23:58:00"
+time_limit: "24:00:00"
+# time_limit: "29:00"
 
 # Additional SBATCH arguments (optional)
 additional_sbatch_args:
@@ -22,8 +23,9 @@ additional_sbatch_args:
 # The total number of nodes will be num_inference_servers * num_nodes_per_inference_server.
 num_inference_servers: 1
 num_nodes_per_inference_server: 1 # Increase this only if your model requires more than 1 node per inference server.
-parallel_tasks: 8  # Max concurrent lm-eval processes per job (one per task). Requires 'prepare' to be run first. 1 = sequential.
+parallel_tasks: 8 # Max concurrent lm-eval processes per job (one per task). Requires 'prepare' to be run first. 1 = sequential.
 task_batch_size: 8  # Tasks per lm-eval invocation (parallel mode). Larger = less filesystem I/O, but more progress lost on failure.
+
 
 # === Environment Configuration ===
 # Option 1: Use pixi (set pixi_manifest and pixi_env)
@@ -33,6 +35,7 @@ pixi_env: "default"  # Name of the pixi environment to use (see README.md).
 env_activation_command:  # Custom command to activate the environment, e.g. "source ./activate.sh"
 env_vars:
   HF_HUB_OFFLINE: "1" # you should download data and model beforehand
+  HF_ALLOW_CODE_EVAL: "1"
   TORCHINDUCTOR_CACHE_DIR: "${SCRATCH}/tmp_home/torchinductor_${SLURM_JOB_ID}"
   VLLM_CACHE_ROOT: "${SCRATCH}/tmp_home/vllm_cache_${SLURM_JOB_ID}"
 
@@ -52,7 +55,8 @@ inference_server_command: >-
       --host 0.0.0.0
       --port ${EH_PORT}
       --data-parallel-size 4
-      --max-num-seqs 512
+      --max-num-seqs 128
+      --max_num_batched_tokens 16384
       --max-model-len 4096
       --enable-chunked-prefill
       --enable-prefix-caching
@@ -68,8 +72,8 @@ health_check_interval_seconds: 20  # Interval between health check attempts
 eval:
   eval_suite_path: "/leonardo_work/AIFAC_L01_028/midahl00/base-eval-suite" # path to the eval suite directory
   suites_and_tasks:
-    - eng_base_easy
-    - deu_base_easy
+    - eng_base_full
+    - deu_base_full
   # --model_args: joined as key=value,key=value
   model_args:
     model: ${EH_MODEL_PATH}
@@ -85,25 +89,16 @@ eval:
   lm_eval_args:
     model: local-completions
     batch_size: 16
-    log_samples: true
+    confirm_run_unsafe_code: true
 
 # === Output Configuration ===
-output_path: ""
+output_path: "eval_results/ref_models"
 request_cache_dir: "lm_eval_requests_cache"  # optional: shared request cache for lm-eval (LM_HARNESS_CACHE_PATH)
 
 # === HuggingFace Results ===
-# Optional: HF dataset repo for result storage (e.g. 'org/eval-scores').
-# When set, model-task-combinations already covered in the repo are skipped,
-# and 'collect --upload' pushes results to it.
-# hf_result_repo: "org/eval-scores"
+hf_result_repo: "ellamind/eval-scores-ref"
 
 models:
-  qwen3_4b:
-    model_key: qwen3_4b
-    path: "/leonardo_work/AIFAC_L01_028/models/Qwen/Qwen3-4B-Base/main"
-    display_name: "Qwen3 4B"
-    tokens_trained: 36T
-
   smollm3_3b_stage1:
     model_key: smollm3_3b
     path: "/leonardo_work/AIFAC_L01_028/models/HuggingFaceTB/SmolLM3-3B-checkpoints"
@@ -115,4 +110,24 @@ models:
       280000, 360000, 480000, 640000, 800000,
       1000000, 1200000, 1400000, 1600000, 2000000,
       2400000, 2800000, 3200000, 3440000
+    ]
+  smollm3_3b_stage2:
+    model_key: smollm3_3b
+    path: "/leonardo_work/AIFAC_L01_028/models/HuggingFaceTB/SmolLM3-3B-checkpoints"
+    checkpoint_pattern: "stage2-step-{step}"
+    display_name: "SmolLM3 3B"
+    train_batch_size: 2_359_296
+    steps: [
+      3480000, 3560000, 3640000, 3760000,
+      3880000, 4000000, 4120000, 4200000
+    ]
+  smollm3_3b_stage3:
+    model_key: smollm3_3b
+    path: "/leonardo_work/AIFAC_L01_028/models/HuggingFaceTB/SmolLM3-3B-checkpoints"
+    checkpoint_pattern: "stage3-step-{step}"
+    display_name: "SmolLM3 3B"
+    train_batch_size: 2_359_296
+    steps: [
+      4240000, 4320000, 4400000, 4480000,
+      4560000, 4640000, 4720000
     ]

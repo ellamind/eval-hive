@@ -91,16 +91,21 @@ def discover_results(
 def collect_from_run(
     run_dir: Path,
     output_parquet: Path,
+    hf_repo: str | None = None,
 ) -> pl.DataFrame:
     """Collect all results from a run directory into a parquet file.
 
     1. Read ``eh_manifest.json`` and ``eh_config.yaml`` from *run_dir*.
     2. Discover result files under the configured ``output_path``.
     3. Parse each result file into ScoreRow records.
-    4. Aggregate group/suite scores from the YAML hierarchy.
-    5. Write combined leaf + aggregate rows to *output_parquet*.
+    4. If *hf_repo* is set, pull existing HF scores, overwrite with fresh
+       local results, then aggregate over the combined benchmark set.
+    5. Aggregate group/suite scores from the YAML hierarchy.
+    6. Write the full dataset (HF + local leaves + fresh aggregates) to
+       *output_parquet*.
     """
     from eval_hive.results.aggregate import aggregate_scores
+    from eval_hive.results.hf import DEDUP_COLS, download_hf_parquet, merge_and_dedup
     from eval_hive.results.parse import parse_result_file
 
     # Load manifest and config
@@ -159,27 +164,84 @@ def collect_from_run(
         if row.get("subtask_tree") is not None:
             row["subtask_tree"] = json.dumps(row["subtask_tree"])
 
-    leaf_df = pl.DataFrame(all_rows, infer_schema_length=None)
+    local_df = pl.DataFrame(all_rows, infer_schema_length=None)
 
-    # Aggregate group/suite scores from YAML hierarchy
+    # ── Pull HF scores and merge with local results ──────────────────────
+    # Download once; local results overwrite HF on the dedup key.
+    # We strip old aggregates from HF since we'll recompute them below.
+    hf_df: pl.DataFrame | None = None
+    if hf_repo:
+        hf_df = download_hf_parquet(hf_repo)
+
+    # Only models in this run's manifest should be aggregated.
+    run_models = set(entry["model_key"] for entry in manifest.values())
+
+    if hf_df is not None and len(hf_df) > 0:
+        # Restrict HF data to models from this run
+        hf_benchmarks = hf_df.filter(
+            (pl.col("task_type") == "benchmark") & pl.col("model").is_in(run_models)
+        )
+        merged_benchmarks = merge_and_dedup(hf_benchmarks, local_df)
+        # Keep only benchmark rows for aggregation input
+        benchmarks = merged_benchmarks.filter(pl.col("task_type") == "benchmark")
+        logger.info(
+            "Aggregation input: {} benchmark rows (local + HF)", len(benchmarks),
+        )
+    else:
+        benchmarks = local_df.filter(pl.col("task_type") == "benchmark")
+
+    # ── Aggregate group/suite scores from YAML hierarchy ─────────────────
     task_dirs = _resolve_task_dirs(config)
     if task_dirs:
-        # Filter to benchmark rows for aggregation input
-        benchmarks = leaf_df.filter(pl.col("task_type") == "benchmark")
         agg_df = aggregate_scores(
             benchmarks,
             task_dirs,
             config.eval.suites_and_tasks,
         )
-        if len(agg_df) > 0:
-            leaf_df = pl.concat([leaf_df, agg_df], how="diagonal_relaxed")
+    else:
+        agg_df = pl.DataFrame()
+
+    # ── Assemble final dataset ───────────────────────────────────────────
+    # For this run's models: HF benchmarks + local leaves + fresh aggregates.
+    # For other models: keep their existing HF data unchanged.
+    if hf_df is not None and len(hf_df) > 0:
+        hf_run_benchmarks = hf_df.filter(
+            (pl.col("task_type") == "benchmark") & pl.col("model").is_in(run_models)
+        )
+        hf_other_models = hf_df.filter(~pl.col("model").is_in(run_models))
+        run_combined = merge_and_dedup(hf_run_benchmarks, local_df)
+    else:
+        hf_other_models = pl.DataFrame()
+        run_combined = local_df
+
+    # Drop any stale aggregates that came through local_df (parsed from
+    # lm-eval group_subtasks); we replace them with fresh ones.
+    run_combined = run_combined.filter(pl.col("task_type") == "benchmark")
+
+    if len(agg_df) > 0:
+        run_combined = pl.concat([run_combined, agg_df], how="diagonal_relaxed")
+
+    # Merge back with other models' data
+    if len(hf_other_models) > 0:
+        combined = pl.concat([hf_other_models, run_combined], how="diagonal_relaxed")
+    else:
+        combined = run_combined
+
+    # diagonal_relaxed may upcast nullable Int64 → Float64; cast back to Int64
+    # so that large token counts don't suffer floating-point precision loss.
+    for col in ("tokens_trained", "train_batch_size"):
+        if col in combined.columns and combined[col].dtype != pl.Int64:
+            if combined[col].dtype.is_numeric():
+                combined = combined.with_columns(pl.col(col).round(0).cast(pl.Int64))
+            else:
+                combined = combined.with_columns(pl.col(col).cast(pl.Int64, strict=False))
 
     # Reclassify: configured suites that were parsed as task_group → eval_suite.
     # This fixes misclassification when lm-eval wraps suites in an implicit
     # root group (making them appear as children in group_subtasks).
     suite_names = set(config.eval.suites_and_tasks)
-    if suite_names and "task" in leaf_df.columns and "task_type" in leaf_df.columns:
-        leaf_df = leaf_df.with_columns(
+    if suite_names and "task" in combined.columns and "task_type" in combined.columns:
+        combined = combined.with_columns(
             pl.when(
                 pl.col("task").is_in(suite_names) & (pl.col("task_type") == "task_group")
             )
@@ -189,14 +251,14 @@ def collect_from_run(
         )
 
     # Deterministic sort
-    sort_cols = [c for c in ["model", "step", "task", "metric", "metric_filter"] if c in leaf_df.columns]
+    sort_cols = [c for c in ["model", "step", "task", "metric", "metric_filter"] if c in combined.columns]
     if sort_cols:
-        leaf_df = leaf_df.sort(sort_cols, nulls_last=False)
+        combined = combined.sort(sort_cols, nulls_last=False)
 
-    leaf_df.write_parquet(output_parquet)
-    logger.info("Wrote {} rows to {}", len(leaf_df), output_parquet)
+    combined.write_parquet(output_parquet)
+    logger.info("Wrote {} rows to {}", len(combined), output_parquet)
 
-    return leaf_df
+    return combined
 
 
 def _resolve_task_dirs(config) -> list[Path]:
@@ -252,11 +314,8 @@ def run(args: argparse.Namespace) -> int:
             logger.error("Required file not found: {}", run_dir / required)
             return 1
 
-    df = collect_from_run(run_dir, output)
-
-    if len(df) == 0:
-        return 0
-
+    # Resolve HF repo so we can use it for both aggregation and upload
+    hf_repo: str | None = None
     if args.upload is not None:
         if isinstance(args.upload, str):
             hf_repo = args.upload
@@ -266,8 +325,15 @@ def run(args: argparse.Namespace) -> int:
                 logger.error("--upload requires 'hf_result_repo' to be set in the config")
                 return 1
             hf_repo = config.hf_result_repo
-        from eval_hive.results.hf import push_to_hf
 
-        push_to_hf(output, hf_repo)
+    df = collect_from_run(run_dir, output, hf_repo=hf_repo)
+
+    if len(df) == 0:
+        return 0
+
+    if hf_repo is not None:
+        from eval_hive.results.hf import upload_hf_parquet
+
+        upload_hf_parquet(output, hf_repo)
 
     return 0

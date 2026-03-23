@@ -205,6 +205,12 @@ def parse_result_file(
 
         # Per-task config struct
         if task_cfg:
+            _doc_to_text = task_cfg.get("doc_to_text")
+            if _doc_to_text is not None and not isinstance(_doc_to_text, str):
+                _doc_to_text = str(_doc_to_text)
+            _doc_to_target = task_cfg.get("doc_to_target")
+            if _doc_to_target is not None and not isinstance(_doc_to_target, str):
+                _doc_to_target = str(_doc_to_target)
             _doc_to_choice = task_cfg.get("doc_to_choice")
             if _doc_to_choice is not None and not isinstance(_doc_to_choice, str):
                 _doc_to_choice = json.dumps(_doc_to_choice)
@@ -218,8 +224,8 @@ def parse_result_file(
                 output_type=output_type,
                 dataset_name=task_cfg.get("dataset_name"),
                 repeats=task_cfg.get("repeats"),
-                doc_to_text=task_cfg.get("doc_to_text"),
-                doc_to_target=task_cfg.get("doc_to_target"),
+                doc_to_text=_doc_to_text,
+                doc_to_target=_doc_to_target,
                 doc_to_choice=_doc_to_choice,
                 generation_kwargs=_gen_kwargs,
                 should_decontaminate=task_cfg.get("should_decontaminate"),

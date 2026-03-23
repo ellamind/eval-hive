@@ -53,7 +53,11 @@ def run(args: argparse.Namespace) -> int:
         for label, step, path in model_paths:
             exists = path.is_dir() or path.is_file()
             key = manifest_key(effective_model_key, label)
-            tokens = entry.tokens_trained
+            if isinstance(entry.tokens_trained, list):
+                step_idx = entry.steps.index(step) if step is not None and entry.steps else None
+                tokens = entry.tokens_trained[step_idx] if step_idx is not None else None
+            else:
+                tokens = entry.tokens_trained
             if tokens is None and entry.train_batch_size is not None and step is not None:
                 tokens = entry.train_batch_size * step
             rows.append([

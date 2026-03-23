@@ -94,7 +94,8 @@ def get_tasks_to_submit(
         logger.error(f"Error checking SLURM queue: {e}")
         raise
 
-    in_queue = {j["task_key"] for j in active}
+    in_queue = {j["task_key"] for j in active if j["task_key"] in manifest}
+    active = [j for j in active if j["task_key"] in manifest]
 
     to_submit = [
         key for key in all_keys
@@ -120,13 +121,14 @@ def get_tasks_to_submit(
             total, n_disk, n_hf_only, _, _ = count_task_coverage(
                 output_path, manifest, all_tasks, hf_covered,
             )
-            n_remaining = total - n_disk - n_hf_only
+            n_done = n_disk + n_hf_only
+            n_remaining = total - n_done
             parts = []
             if n_disk:
                 parts.append(f"{n_disk} on disk")
             if n_hf_only:
                 parts.append(f"{n_hf_only} on HF")
-            task_line = f"{n_remaining}/{total} remaining"
+            task_line = f"{n_done}/{total} done, {n_remaining} remaining"
             if parts:
                 task_line += f"  ({', '.join(parts)})"
 

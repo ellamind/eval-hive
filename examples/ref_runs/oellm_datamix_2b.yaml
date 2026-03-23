@@ -1,0 +1,156 @@
+# === Placeholder variables ===
+# substituted at runtime:
+#   ${EH_PORT}        — dynamically assigned port (random 30000-59999)
+#   ${EH_MODEL_PATH}  — resolved model path (local path or HF cache path)
+
+# === SLURM Configuration ===
+# Consult your cluster's documentation if you are unsure about the values below.
+job_name: "eval"
+partition: "boost_usr_prod"
+account: "oellm_prod2026"
+# qos: "boost_qos_dbg"
+qos: "normal"
+cpus_per_node: 32 
+gres_per_node: "gpu:4"
+time_limit: "6:00:00"
+# time_limit: "29:00"
+
+# Additional SBATCH arguments (optional)
+additional_sbatch_args:
+# exclude: "node[001-010]"  # Exclude specific nodes
+
+# === Scaling Configuration ===
+# The total number of nodes will be num_inference_servers * num_nodes_per_inference_server.
+num_inference_servers: 1
+num_nodes_per_inference_server: 1 # Increase this only if your model requires more than 1 node per inference server.
+parallel_tasks: 8 # Max concurrent lm-eval processes per job (one per task). Requires 'prepare' to be run first. 1 = sequential.
+task_batch_size: 8  # Tasks per lm-eval invocation (parallel mode). Larger = less filesystem I/O, but more progress lost on failure.
+
+
+# === Environment Configuration ===
+# Option 1: Use pixi (set pixi_manifest and pixi_env)
+pixi_manifest: "pixi.toml"  # Path to the pixi manifest file. Edit only if you want to use one of the pre-installed environments (see README.md).
+pixi_env: "default"  # Name of the pixi environment to use (see README.md).
+# Option 2: Use a custom activation command (clear pixi_manifest and pixi_env above, set env_activation_command)
+env_activation_command:  # Custom command to activate the environment, e.g. "source ./activate.sh"
+env_vars:
+  HF_HUB_OFFLINE: "1" # you should download data and model beforehand
+  HF_ALLOW_CODE_EVAL: "1"
+  TORCHINDUCTOR_CACHE_DIR: "${SCRATCH}/tmp_home/torchinductor_${SLURM_JOB_ID}"
+  VLLM_CACHE_ROOT: "${SCRATCH}/tmp_home/vllm_cache_${SLURM_JOB_ID}"
+
+# === Inference Server Configuration ===
+# Port is dynamically set by inference-hive using $EH_PORT (random port 30000-59999)
+# This avoids port collisions when multiple shards run on the same node.
+# 
+# Model path is dynamically set by inference-hive using $EH_MODEL_PATH (local path or HF cache path)
+inference_server_command: >-
+  singularity exec --nv
+  --env HF_HUB_OFFLINE=1
+  --home $SCRATCH/tmp_home
+  --bind $SCRATCH/tmp_home/container_tmp:/tmp
+  --bind ${EH_MODEL_PATH}:${EH_MODEL_PATH}
+  /leonardo_work/AIFAC_L01_028/midahl00/base-eval-suite/containers/vllm/vllm-openai_v0.14.1.sif
+  vllm serve ${EH_MODEL_PATH}
+      --host 0.0.0.0
+      --port ${EH_PORT}
+      --tensor-parallel-size 4
+      --max-num-seqs 512
+      --max_num_batched_tokens 16384
+      --max-model-len 2048
+      --enable-chunked-prefill
+      --enable-prefix-caching
+      --gpu-memory-utilization 0.6
+
+# === Health Check Configuration ===
+# max_wait_minutes is the maximum time to wait for the API server to become healthy.
+# make sure it is reasonable for loading the model. larger models will take longer.
+health_check_max_wait_minutes: 10  # Maximum time to wait for API server to become healthy.
+health_check_interval_seconds: 20  # Interval between health check attempts
+
+# === Eval Configuration ===
+eval:
+  eval_suite_path: "/leonardo_work/AIFAC_L01_028/midahl00/base-eval-suite" # path to the eval suite directory
+  suites_and_tasks:
+    - eng_base_full
+    - deu_base_full
+  # --model_args: joined as key=value,key=value
+  model_args:
+    model: ${EH_MODEL_PATH}
+    tokenizer: ${EH_MODEL_PATH}
+    base_url: http://localhost:${EH_PORT}/v1/completions
+    num_concurrent: 8
+    max_length: 2048
+  # HTTP timeout and retries for lm-eval API requests.
+  # Injected into model_args unless already set there.
+  timeout: 600        # seconds (default: 600)
+  max_retries: 5      # attempts (default: 5)
+  # All other lm_eval CLI flags, passed through as --key value
+  lm_eval_args:
+    model: local-completions
+    batch_size: 16
+    confirm_run_unsafe_code: true
+
+# === Output Configuration ===
+output_path: "eval_results/ref_models"
+request_cache_dir: "lm_eval_requests_cache"  # optional: shared request cache for lm-eval (LM_HARNESS_CACHE_PATH)
+
+# === HuggingFace Results ===
+hf_result_repo: "ellamind/eval-scores-ref"
+
+models:
+  oellm_datamix_2b_60_40_main:
+    model_key: oellm_datamix_2b_60_40
+    path: "/leonardo_work/AIFAC_L01_028/models/openeurollm/datamix-2b-60-40/main"
+    display_name: "OELLM datamix 2B 60-40"
+    tokens_trained: 4T
+
+  oellm_datamix_2b_60_40_checkpoints:
+    model_key: oellm_datamix_2b_60_40
+    path: "/leonardo_work/AIFAC_L01_028/models/openeurollm/datamix-2b-60-40"
+    checkpoint_pattern: "iter_{step}"
+    display_name: "OELLM datamix 2B 60-40"
+    train_batch_size: 4_194_304
+    steps: [10000, 20000, 30000, 40000, 50000, 60000, 70000, 80000, 90000, 100000, 110000, 120000, 130000, 140000, 150000, 160000, 170000, 180000, 190000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000, 650000, 700000, 750000, 800000, 850000, 900000, 950000]
+
+  oellm_datamix_2b_70_30_main:
+    model_key: oellm_datamix_2b_70_30
+    path: "/leonardo_work/AIFAC_L01_028/models/openeurollm/datamix-2b-70-30/main"
+    display_name: "OELLM datamix 2B 70-30"
+    tokens_trained: 4T
+
+  oellm_datamix_2b_70_30_checkpoints:
+    model_key: oellm_datamix_2b_70_30
+    path: "/leonardo_work/AIFAC_L01_028/models/openeurollm/datamix-2b-70-30"
+    checkpoint_pattern: "iter_{step}"
+    display_name: "OELLM datamix 2B 70-30"
+    train_batch_size: 4_194_304
+    steps: [10000, 20000, 30000, 40000, 50000, 60000, 70000, 80000, 90000, 100000, 110000, 120000, 130000, 140000, 150000, 160000, 170000, 180000, 190000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000, 650000, 700000, 750000, 800000, 850000, 900000, 950000]
+
+  oellm_datamix_2b_80_20_main:
+    model_key: oellm_datamix_2b_80_20
+    path: "/leonardo_work/AIFAC_L01_028/models/openeurollm/datamix-2b-80-20/main"
+    display_name: "OELLM datamix 2B 80-20"
+    tokens_trained: 4T
+
+  oellm_datamix_2b_80_20_checkpoints:
+    model_key: oellm_datamix_2b_80_20
+    path: "/leonardo_work/AIFAC_L01_028/models/openeurollm/datamix-2b-80-20"
+    checkpoint_pattern: "iter_{step}"
+    display_name: "OELLM datamix 2B 80-20"
+    train_batch_size: 4_194_304
+    steps: [10000, 20000, 30000, 40000, 50000, 60000, 70000, 80000, 90000, 100000, 110000, 120000, 130000, 140000, 150000, 160000, 170000, 180000, 190000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000, 650000, 700000, 750000, 800000, 850000, 900000, 950000]
+
+  oellm_datamix_2b_90_10_main:
+    model_key: oellm_datamix_2b_90_10
+    path: "/leonardo_work/AIFAC_L01_028/models/openeurollm/datamix-2b-90-10/main"
+    display_name: "OELLM datamix 2B 90-10"
+    tokens_trained: 4T
+
+  oellm_datamix_2b_90_10_checkpoints:
+    model_key: oellm_datamix_2b_90_10
+    path: "/leonardo_work/AIFAC_L01_028/models/openeurollm/datamix-2b-90-10"
+    checkpoint_pattern: "iter_{step}"
+    display_name: "OELLM datamix 2B 90-10"
+    train_batch_size: 4_194_304
+    steps: [10000, 20000, 30000, 40000, 50000, 60000, 70000, 80000, 90000, 100000, 110000, 120000, 130000, 140000, 150000, 160000, 170000, 180000, 190000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000, 650000, 700000, 750000, 800000, 850000, 900000, 950000]
