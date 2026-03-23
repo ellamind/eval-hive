@@ -23,8 +23,8 @@ eval-hive manages the full evaluation lifecycle. Configure models and eval suite
 Requires [pixi](https://pixi.sh). Clone the repo and let pixi handle the environment:
 
 ```bash
-git clone git@github.com:ellamind/eval-hive-2.git
-cd eval-hive-2
+git clone git@github.com:ellamind/eval-hive.git
+cd eval-hive
 pixi install
 ```
 
