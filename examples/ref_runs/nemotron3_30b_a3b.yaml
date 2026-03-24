@@ -74,7 +74,11 @@ eval:
   eval_suite_path: "/leonardo_work/AIFAC_L01_028/midahl00/base-eval-suite" # path to the eval suite directory
   suites_and_tasks:
     - eng_base_full
+    - eng_base_main
+    - eng_base_easy
     - deu_base_full
+    - deu_base_main
+    - deu_base_easy
   # --model_args: joined as key=value,key=value
   model_args:
     model: ${EH_MODEL_PATH}
