@@ -206,6 +206,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="Maximum number of jobs to submit per cycle",
     )
     parser.add_argument(
+        "--task-key", nargs="+", default=None,
+        help="Only submit these specific task keys (exact match, as shown in status/dry run)",
+    )
+    parser.add_argument(
         "--retry-interval", type=int, default=None,
         help="Retry interval in minutes. Script will keep retrying until all tasks are submitted.",
     )
@@ -236,6 +240,13 @@ def run(args: argparse.Namespace) -> int:
             output_path=config.output_path,
             suites=config.eval.suites_and_tasks,
         )
+
+        if args.task_key:
+            unknown = set(args.task_key) - set(manifest.keys())
+            if unknown:
+                logger.error(f"Unknown task keys: {', '.join(sorted(unknown))}")
+                return 1
+            tasks_to_submit = [k for k in tasks_to_submit if k in set(args.task_key)]
 
         if not tasks_to_submit:
             logger.info("Nothing to submit.")

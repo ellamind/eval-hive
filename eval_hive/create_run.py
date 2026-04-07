@@ -159,6 +159,55 @@ def sync_hf_markers(
     return covered
 
 
+def _mark_locally_complete(
+    output_path: Path,
+    manifest: dict[str, dict],
+    task_map: dict[str, list[str]],
+    suites: list[str],
+    hf_covered: dict[str, list[str]] | None,
+    progress_dir: Path,
+) -> None:
+    """Append manifest keys that are fully covered (disk + HF) to jobs_completed.log."""
+    all_tasks: set[str] = set()
+    for s in suites:
+        all_tasks.update(task_map.get(s, []))
+    if not all_tasks:
+        return
+
+    completed_file = progress_dir / "jobs_completed.log"
+    existing: set[str] = set()
+    if completed_file.exists():
+        existing = {
+            line.strip()
+            for line in completed_file.read_text().splitlines()
+            if line.strip()
+        }
+
+    _cache: dict[tuple[str, str], set[str]] = {}
+    new_keys: list[str] = []
+
+    for mkey, entry in manifest.items():
+        if mkey in existing:
+            continue
+        mk, lbl = entry["model_key"], entry["label"]
+        cache_key = (mk, lbl)
+        if cache_key not in _cache:
+            base = output_path / mk / lbl
+            _cache[cache_key] = _collect_completed_tasks(base)
+        disk = _cache[cache_key]
+
+        hf_tasks = set(hf_covered.get(mkey, [])) if hf_covered else set()
+        covered = sum(1 for t in all_tasks if t in disk or t in hf_tasks)
+        if covered == len(all_tasks):
+            new_keys.append(mkey)
+
+    if new_keys:
+        with open(completed_file, "a") as f:
+            for key in new_keys:
+                f.write(f"{key}\n")
+        logger.info("Marked {} job(s) as completed from local results", len(new_keys))
+
+
 def _collect_completed_tasks(base: Path) -> set[str]:
     """Scan all result files under *base* to find completed task names.
 
@@ -274,6 +323,20 @@ def build_env_exports(config: EhConfig) -> str:
         for key, value in config.env_vars.items():
             lines += f'export {key}="{value}"\n'
     return lines
+
+
+def build_env_exports_inline(config: EhConfig) -> str:
+    """Build env exports as a single-line bash snippet for use inside bash -c.
+
+    Re-exporting env_vars inside srun steps allows variables like
+    ${EH_SERVER_ID} (set per srun step) to be expanded correctly.
+    """
+    if not config.env_vars:
+        return ""
+    parts = []
+    for key, value in config.env_vars.items():
+        parts.append(f'export {key}="{value}";')
+    return " ".join(parts) + " "
 
 
 def build_env_activation_block(config: EhConfig) -> str:
@@ -419,8 +482,15 @@ log "INFO" "Model key:  $EH_MODEL_KEY"
 log "INFO" "Label:      $EH_LABEL"
 log "INFO" "Model path: $EH_MODEL_PATH"
 
-# ── Dynamic port ──────────────────────────────────────────────
-EH_PORT=$((30000 + RANDOM % 30000))
+# ── Dynamic port (bind-tested to avoid "address already in use") ─
+for _try in $(seq 1 20); do
+    EH_PORT=$((30000 + RANDOM % 30000))
+    if python3 -c "import socket; s=socket.socket(); s.bind(('', $EH_PORT)); s.close()" 2>/dev/null; then
+        break
+    fi
+    log "WARN" "Port $EH_PORT already in use, retrying ($_try/20)"
+    [ "$_try" -eq 20 ] && {{ log "ERROR" "No free port after 20 attempts"; exit 1; }}
+done
 export EH_PORT
 log "INFO" "Dynamic port: EH_PORT=$EH_PORT"
 
@@ -430,6 +500,9 @@ log "INFO" "python path: $(which python)"
 
 # ── Environment exports ───────────────────────────────────────
 {env_exports}
+
+# ── Unset proxy vars (all traffic is cluster-internal) ────────
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY
 
 # ── Request cache ─────────────────────────────────────────────
 {request_cache_block}
@@ -520,7 +593,7 @@ log "INFO" "Command: ${{SERVER_COMMAND}}"
 # srun inherits all of them from the job environment, causing a fatal error).
 unset SLURM_MEM_PER_CPU SLURM_MEM_PER_GPU SLURM_MEM_PER_NODE
 
-setsid srun --cpu-bind=none \
+setsid --wait srun --cpu-bind=none \
     --output="$INFERENCE_SERVER_LOG" --error="$INFERENCE_SERVER_LOG" \
     --export=ALL,NO_COLOR=1 \
     bash -c "${{SERVER_COMMAND}}" &
@@ -545,18 +618,19 @@ wait_for_server() {{
     local health_url="http://localhost:${{EH_PORT}}/health"
 
     while [ $attempt -lt $max_attempts ]; do
-        log "INFO" "Health check $((attempt + 1))/${{max_attempts}} for $health_url"
         if ! kill -0 $SERVER_PID 2>/dev/null; then
             log "ERROR" "Server process died during health checks"
             wait $SERVER_PID 2>/dev/null
             log_failed "server_died_during_healthcheck" "PID $SERVER_PID terminated"
             return 1
         fi
-        if curl -s --connect-timeout 5 --max-time 10 "$health_url" >/dev/null 2>&1; then
+        local hc_status
+        hc_status="$(curl --noproxy '*' -s -o /dev/null -w '%{{http_code}}' --connect-timeout 5 --max-time 10 "$health_url")" || true
+        if [ "$hc_status" = "200" ]; then
             log "INFO" "Inference server is healthy!"
             return 0
         fi
-        log "INFO" "Not ready, waiting {health_check_interval_seconds}s..."
+        log "INFO" "Not ready (HTTP $hc_status), waiting {health_check_interval_seconds}s... ($((attempt + 1))/${{max_attempts}})"
         sleep {health_check_interval_seconds}
         attempt=$((attempt + 1))
     done
@@ -668,13 +742,13 @@ for i in $(seq 0 $((NUM_SERVERS - 1))); do
 
     log "INFO" "Starting server $i on nodes: $NODELIST (head: $HEAD_NODE)"
 
-    setsid srun \
+    setsid --wait srun \
         --cpu-bind=none \
         --nodes=$NODES_PER_SERVER \
         --nodelist="$NODELIST" \
         --output="$SERVER_LOG" --error="$SERVER_LOG" \
-        --export=ALL,NO_COLOR=1 \
-        bash -c "$SERVER_COMMAND" &
+        --export=ALL,NO_COLOR=1,EH_SERVER_ID=$i \
+        bash -c "{env_re_exports}$SERVER_COMMAND" &
 
     SERVER_PIDS[$i]=$!
     SERVER_HEAD_NODES[$i]="$HEAD_NODE"
@@ -721,11 +795,13 @@ wait_for_all_servers() {{
                 log_failed "server_died_during_healthcheck" "server=$i"
                 return 1
             fi
-            if curl -s --connect-timeout 5 --max-time 10 "$health_url" >/dev/null 2>&1; then
+            local hc_status
+            hc_status="$(curl --noproxy '*' -s -o /dev/null -w '%{{http_code}}' --connect-timeout 5 --max-time 10 "$health_url")" || true
+            if [ "$hc_status" = "200" ]; then
                 log "INFO" "Server $i is healthy!"
                 break
             fi
-            log "INFO" "Server $i not ready, waiting {health_check_interval_seconds}s... ($((attempt + 1))/$max_attempts)"
+            log "INFO" "Server $i not ready (HTTP $hc_status), waiting {health_check_interval_seconds}s... ($((attempt + 1))/$max_attempts)"
             sleep {health_check_interval_seconds}
             attempt=$((attempt + 1))
         done
@@ -764,7 +840,7 @@ sleep 2
 LB_HEALTH_URL="http://localhost:${{EH_PORT}}/health"
 LB_ATTEMPTS=0
 while [ $LB_ATTEMPTS -lt 15 ]; do
-    if curl -s --connect-timeout 2 --max-time 5 "$LB_HEALTH_URL" >/dev/null 2>&1; then
+    if [ "$(curl --noproxy '*' -s -o /dev/null -w '%{{http_code}}' --connect-timeout 2 --max-time 5 "$LB_HEALTH_URL")" = "200" ]; then
         log "INFO" "Load balancer is healthy at $LB_HEALTH_URL"
         break
     fi
@@ -886,35 +962,17 @@ TASK_MAP_FILE="$RUN_DIR/eh_task_map.json"
 PARALLEL_TASKS={parallel_tasks}
 TASK_BATCH_SIZE={task_batch_size}
 
-# Collect unique leaf tasks across all suites, interleaved (round-robin)
-# so that tasks from different suites are mixed rather than sequential.
+# Collect unique leaf tasks across all suites (task map is pre-sorted by
+# request type so vLLM sees homogeneous workloads).
 declare -A SEEN_TASKS
-declare -a SUITE_TASKS
-NUM_SUITES=${{#EH_SUITES[@]}}
-MAX_LEN=0
-
-# Read per-suite task lists into arrays
-for (( s=0; s < NUM_SUITES; s++ )); do
-    SUITE="${{EH_SUITES[${{s}}]}}"
-    declare -a "SUITE_${{s}}=()"
-    while IFS= read -r TASK; do
-        eval "SUITE_${{s}}+=(\"$TASK\")"
-    done < <(jq -r ".[\"$SUITE\"][]" "$TASK_MAP_FILE")
-    eval "LEN=\${{#SUITE_${{s}}[@]}}"
-    (( LEN > MAX_LEN )) && MAX_LEN=$LEN
-done
-
-# Interleave: pick one task from each suite in turn
 ALL_TASKS=()
-for (( i=0; i < MAX_LEN; i++ )); do
-    for (( s=0; s < NUM_SUITES; s++ )); do
-        eval "TASK=\${{SUITE_${{s}}[${{i}}]:-}}"
-        [ -z "$TASK" ] && continue
+for SUITE in "${{EH_SUITES[@]}}"; do
+    while IFS= read -r TASK; do
         if [ -z "${{SEEN_TASKS[$TASK]+x}}" ]; then
             ALL_TASKS+=("$TASK")
             SEEN_TASKS[$TASK]=1
         fi
-    done
+    done < <(jq -r ".[\"$SUITE\"][]" "$TASK_MAP_FILE")
 done
 
 log "INFO" "Total unique tasks: ${{#ALL_TASKS[@]}} (from ${{#EH_SUITES[@]}} suite(s), parallel=$PARALLEL_TASKS, batch_size=$TASK_BATCH_SIZE)"
@@ -972,6 +1030,8 @@ log "INFO" "Created ${{#BATCHES[@]}} batch(es) of up to $EFF_BATCH_SIZE task(s)"
 
 # ── Run batched lm-eval with worker pool ─────────────────────
 EVAL_FAILURES=0
+CONSECUTIVE_FAILURES=0
+MAX_CONSECUTIVE_FAILURES=$(( (PARALLEL_TASKS + 1) / 2 + 1 ))
 
 run_task_batch() {{
     local BATCH_IDX="$1"
@@ -1010,10 +1070,13 @@ for (( b=0; b < ${{#BATCHES[@]}}; b++ )); do
             if kill -0 "$pid" 2>/dev/null; then
                 STILL_RUNNING+=("$pid")
             else
-                wait "$pid" || {{
+                if wait "$pid"; then
+                    CONSECUTIVE_FAILURES=0
+                else
                     EVAL_FAILURES=$((EVAL_FAILURES + 1))
+                    CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
                     log "ERROR" "[batch ${{PID_TO_BATCH[$pid]}}] Failed (pid $pid)"
-                }}
+                fi
                 unset PID_TO_BATCH[$pid]
             fi
         done
@@ -1022,17 +1085,32 @@ for (( b=0; b < ${{#BATCHES[@]}}; b++ )); do
             sleep 1
         fi
     done
+    if (( CONSECUTIVE_FAILURES >= MAX_CONSECUTIVE_FAILURES )); then
+        log "ERROR" "Aborting: $CONSECUTIVE_FAILURES consecutive batch failures (server likely dead)"
+        break
+    fi
     run_task_batch "$b" "${{BATCHES[$b]}}" &
     BATCH_PIDS+=($!)
     PID_TO_BATCH[$!]=$b
 done
 
-# Wait for all remaining batches
+# Wait for all remaining batches (kill survivors if threshold reached)
 for pid in "${{BATCH_PIDS[@]}}"; do
-    wait "$pid" || {{
+    if (( CONSECUTIVE_FAILURES >= MAX_CONSECUTIVE_FAILURES )); then
+        log "ERROR" "Killing remaining batches (${{#BATCH_PIDS[@]}} left) — server likely dead"
+        for kpid in "${{BATCH_PIDS[@]}}"; do
+            kill "$kpid" 2>/dev/null
+        done
+        wait
+        break
+    fi
+    if wait "$pid"; then
+        CONSECUTIVE_FAILURES=0
+    else
         EVAL_FAILURES=$((EVAL_FAILURES + 1))
+        CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
         log "ERROR" "[batch ${{PID_TO_BATCH[$pid]}}] Failed (pid $pid)"
-    }}
+    fi
 done
 """
 
@@ -1087,6 +1165,11 @@ def run(args: argparse.Namespace) -> int:
     if run_dir.exists():
         if args.force:
             logger.warning(f"Force overwriting run artifacts in: {run_dir}")
+            # Clear stale completion tracking so HF sync rebuilds it cleanly.
+            # Keep jobs_failed.log — it's diagnostic history, not used for scheduling.
+            completed_file = run_dir / "progress" / "jobs_completed.log"
+            if completed_file.exists():
+                completed_file.unlink()
         elif args.update:
             # Check that only models and suites_and_tasks changed
             existing_config_path = run_dir / "eh_config.yaml"
@@ -1175,7 +1258,7 @@ def run(args: argparse.Namespace) -> int:
         request_cache_block = (
             f'EH_CACHE_TARBALL="{cache_tarball}"\n'
             f'if [ -f "$EH_CACHE_TARBALL" ]; then\n'
-            f'    EH_LOCAL_CACHE="${{TMPDIR:-/tmp}}/lm_eval_cache"\n'
+            f'    EH_LOCAL_CACHE="${{TMPDIR:-/tmp}}/lm_eval_cache_${{SLURM_JOB_ID}}"\n'
             f'    mkdir -p "$EH_LOCAL_CACHE"\n'
             f'    log "INFO" "Extracting request cache tarball to $EH_LOCAL_CACHE"\n'
             f'    tar -xzf "$EH_CACHE_TARBALL" -C "$EH_LOCAL_CACHE"\n'
@@ -1206,6 +1289,7 @@ def run(args: argparse.Namespace) -> int:
                 num_nodes_per_inference_server=config.num_nodes_per_inference_server,
                 health_check_max_wait_minutes=config.health_check_max_wait_minutes,
                 health_check_interval_seconds=config.health_check_interval_seconds,
+                env_re_exports=build_env_exports_inline(config),
             )
             server_shutdown_block = SERVER_SHUTDOWN_BLOCK_MULTI
         else:
@@ -1227,9 +1311,26 @@ def run(args: argparse.Namespace) -> int:
 
     logger.info("Resolving task map...")
     tm = TaskManager(include_path=config.eval.eval_suite_path)
+
+    # Sort tasks by request type so vLLM sees homogeneous workloads:
+    # slow generation types first (they take longest), then fast loglikelihood types.
+    # Within each type: alphabetical by name. Unknown suffixes sort alphabetically after known ones.
+    _SUFFIX_ORDER = {"_code": 0, "_cot": 1, "_gen": 2, "_mc": 3, "_rc": 4}
+
+    def _task_sort_key(name: str) -> tuple[int, str, str]:
+        for suffix, order in _SUFFIX_ORDER.items():
+            if name.endswith(suffix):
+                return (order, suffix, name)
+        # Unknown suffixes: sort after all known types, alphabetically by suffix then name
+        parts = name.rsplit("_", 1)
+        unknown_suffix = f"_{parts[1]}" if len(parts) > 1 else ""
+        return (len(_SUFFIX_ORDER), unknown_suffix, name)
+
     task_map = {}
     for suite_or_task in config.eval.suites_and_tasks:
-        task_map[suite_or_task] = resolve_task_names(tm, [suite_or_task])
+        tasks = resolve_task_names(tm, [suite_or_task])
+        tasks.sort(key=_task_sort_key)
+        task_map[suite_or_task] = tasks
 
     task_map_dst = run_dir / "eh_task_map.json"
     task_map_dst.write_text(json.dumps(task_map, indent=2))
@@ -1247,13 +1348,24 @@ def run(args: argparse.Namespace) -> int:
             progress_dir=progress_dir,
         )
 
+    # Mark jobs that are fully covered (disk + HF) as completed so that
+    # submit skips them even when they weren't completed via HF alone.
+    _mark_locally_complete(
+        output_path=config.output_path,
+        manifest=manifest,
+        task_map=task_map,
+        suites=config.eval.suites_and_tasks,
+        hf_covered=hf_covered,
+        progress_dir=progress_dir,
+    )
+
     # Eval loop block: parallel (per-task) or sequential (per-suite)
     eval_format_vars = {
         "lm_eval_extra_args": build_lm_eval_extra_args(config),
         "model_args_string": build_model_args_string(config),
         "include_path_arg": include_path_arg,
     }
-    if config.parallel_tasks > 1:
+    if config.task_batch_size is not None:
         eval_loop_block = EVAL_LOOP_PARALLEL.format(
             parallel_tasks=config.parallel_tasks,
             task_batch_size=config.task_batch_size,

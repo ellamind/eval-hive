@@ -106,6 +106,7 @@ pixi run eval-hive create-run --config eh_config.yaml --output runs/my-run --upd
 pixi run eval-hive submit runs/my-run
 pixi run eval-hive submit runs/my-run --dry                      # preview only
 pixi run eval-hive submit runs/my-run --limit 5                  # submit at most 5 jobs
+pixi run eval-hive submit runs/my-run --task-key mymodel--ckpt_50000  # submit specific task keys only
 pixi run eval-hive submit runs/my-run --retry-interval 10        # retry every 10 min until all submitted
 
 # Monitor progress

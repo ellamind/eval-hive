@@ -255,10 +255,63 @@ def collect_from_run(
     if sort_cols:
         combined = combined.sort(sort_cols, nulls_last=False)
 
+    # ── Diff summary: compare old vs new parquet ──────────────────────────
+    old_df: pl.DataFrame | None = None
+    if output_parquet.exists():
+        try:
+            old_df = pl.read_parquet(output_parquet)
+        except Exception:
+            old_df = None
+
     combined.write_parquet(output_parquet)
     logger.info("Wrote {} rows to {}", len(combined), output_parquet)
 
+    _log_diff_summary(old_df, combined)
+
+    if hf_df is not None:
+        _log_diff_summary(hf_df, combined, label="HF diff")
+
     return combined
+
+
+_DIFF_KEY_COLS = ["model", "step", "task", "metric", "metric_filter"]
+
+
+def _log_diff_summary(old_df: pl.DataFrame | None, new_df: pl.DataFrame, label: str = "Diff") -> None:
+    """Log a short diff summary comparing the old and new parquet contents."""
+    if old_df is None or len(old_df) == 0:
+        logger.info("{}: +{} rows (new file)", label, len(new_df))
+        return
+
+    key_cols = [c for c in _DIFF_KEY_COLS if c in old_df.columns and c in new_df.columns]
+    if not key_cols:
+        logger.info("{}: {} → {} rows (no key columns to compare)", label, len(old_df), len(new_df))
+        return
+
+    old_keys = old_df.select(key_cols)
+    new_keys = new_df.select(key_cols)
+
+    # Rows in new but not in old → added
+    added = new_keys.join(old_keys, on=key_cols, how="anti")
+    # Rows in old but not in new → removed
+    removed = old_keys.join(new_keys, on=key_cols, how="anti")
+    # Rows present in both → check for value changes
+    n_common = len(new_keys) - len(added)
+
+    # For common rows, check if values actually changed
+    if n_common > 0 and "value" in old_df.columns and "value" in new_df.columns:
+        shared_cols = key_cols + ["value"]
+        old_shared = old_df.select(shared_cols).unique(subset=key_cols, keep="last")
+        new_shared = new_df.select(shared_cols).unique(subset=key_cols, keep="last")
+        matched = old_shared.join(new_shared, on=key_cols, how="inner", suffix="_new")
+        n_updated = matched.filter(pl.col("value") != pl.col("value_new")).height
+    else:
+        n_updated = 0
+
+    logger.info(
+        "{}: {} total → {} total | +{} added, ~{} updated, -{} removed",
+        label, len(old_df), len(new_df), len(added), n_updated, len(removed),
+    )
 
 
 def _resolve_task_dirs(config) -> list[Path]:
@@ -334,6 +387,7 @@ def run(args: argparse.Namespace) -> int:
     if hf_repo is not None:
         from eval_hive.results.hf import upload_hf_parquet
 
+        logger.info("Uploading {} to HuggingFace repo: {}", output, hf_repo)
         upload_hf_parquet(output, hf_repo)
 
     return 0

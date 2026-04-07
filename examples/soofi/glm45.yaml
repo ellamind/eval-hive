@@ -1,0 +1,113 @@
+# === Placeholder variables ===
+# substituted at runtime:
+#   ${EH_PORT}        — dynamically assigned port (random 30000-59999)
+#   ${EH_MODEL_PATH}  — resolved model path (local path or HF cache path)
+
+# === SLURM Configuration ===
+# Consult your cluster's documentation if you are unsure about the values below.
+job_name: "eval"
+partition: "all"
+account: "dev"
+# qos: "boost_qos_dbg"
+qos: "normal"
+cpus_per_node: 24 
+gres_per_node: "gpu:8"
+time_limit: "24:00:00"
+# time_limit: "29:00"
+
+# Additional SBATCH arguments (optional)
+additional_sbatch_args:
+  mem: "100G"
+  exclude: "dgx-3nb-08-14"  # Exclude specific nodes
+
+
+# === Scaling Configuration ===
+# The total number of nodes will be num_inference_servers * num_nodes_per_inference_server.
+num_inference_servers: 4
+num_nodes_per_inference_server: 1 # Increase this only if your model requires more than 1 node per inference server.
+parallel_tasks: 16 # Max concurrent lm-eval processes per job (one per task). Requires 'prepare' to be run first. 1 = sequential.
+task_batch_size: 4  # Tasks per lm-eval invocation (parallel mode). Larger = less filesystem I/O, but more progress lost on failure.
+
+
+# === Environment Configuration ===
+# Option 1: Use pixi (set pixi_manifest and pixi_env)
+pixi_manifest: "pixi.toml"  # Path to the pixi manifest file. Edit only if you want to use one of the pre-installed environments (see README.md).
+pixi_env: "default"  # Name of the pixi environment to use (see README.md).
+# Option 2: Use a custom activation command (clear pixi_manifest and pixi_env above, set env_activation_command)
+env_activation_command:  # Custom command to activate the environment, e.g. "source ./activate.sh"
+env_vars:
+  HF_HUB_OFFLINE: "1" # you should download data and model beforehand
+  HF_ALLOW_CODE_EVAL: "1"
+  # In multi-server mode, ${EH_SERVER_ID} (0, 1, …) is set per server.
+  # Use it to isolate torch's inductor cache per node — without it, workers
+  # on different nodes race on the same triton compilation artifacts over NFS.
+  TORCHINDUCTOR_CACHE_DIR: "/tmp/torchinductor_${SLURM_JOB_ID}_${EH_SERVER_ID}"
+  VLLM_CACHE_ROOT: "/tmp/vllm_cache_${SLURM_JOB_ID}"
+  # FlashInfer cubins use the default ~/.cache/flashinfer/ (pre-downloaded).
+  # No need for per-job isolation — cubins are write-once, read-many.
+
+# === Inference Server Configuration ===
+# Port is dynamically set by inference-hive using $EH_PORT (random port 30000-59999)
+# This avoids port collisions when multiple shards run on the same node.
+# 
+# Model path is dynamically set by inference-hive using $EH_MODEL_PATH (local path or HF cache path)
+inference_server_command: >-
+  pixi run --frozen --manifest-path /data/maximilian.idahl/envs/vllm vllm serve ${EH_MODEL_PATH}
+      --host 0.0.0.0
+      --port ${EH_PORT}
+      --max-num-seqs 64
+      --max-num-batched-tokens 16384
+      --max-model-len 8192
+      --enable-chunked-prefill
+      --enable-prefix-caching
+      --gpu-memory-utilization 0.9
+      --trust-remote-code
+      --tensor-parallel-size 8
+
+# === Health Check Configuration ===
+# max_wait_minutes is the maximum time to wait for the API server to become healthy.
+# make sure it is reasonable for loading the model. larger models will take longer.
+health_check_max_wait_minutes: 60  # Maximum time to wait for API server to become healthy.
+health_check_interval_seconds: 20  # Interval between health check attempts
+
+# === Eval Configuration ===
+eval:
+  eval_suite_path: "/data/maximilian.idahl/base-eval" # path to the eval suite directory
+  suites_and_tasks:
+    - eng_base_full
+    - eng_base_main
+    - eng_base_easy
+    - deu_base_full
+    - deu_base_main
+    - deu_base_easy
+  # --model_args: joined as key=value,key=value
+  model_args:
+    model: ${EH_MODEL_PATH}
+    tokenizer: ${EH_MODEL_PATH}
+    base_url: http://localhost:${EH_PORT}/v1/completions
+    num_concurrent: 4
+    max_length: 8192
+    tokenizer_backend: huggingface
+  # HTTP timeout and retries for lm-eval API requests.
+  # Injected into model_args unless already set there.
+  timeout: 2400        # seconds (default: 600)
+  max_retries: 5      # attempts (default: 5)
+  # All other lm_eval CLI flags, passed through as --key value
+  lm_eval_args:
+    model: local-completions
+    batch_size: 16
+    confirm_run_unsafe_code: true
+
+# === Output Configuration ===
+output_path: "eval_results/soofi_models"
+request_cache_dir: "lm_eval_requests_cache"  # optional: shared request cache for lm-eval (LM_HARNESS_CACHE_PATH)
+
+# === HuggingFace Results ===
+hf_result_repo: "ellamind/eval-scores-ref"
+
+models:
+  glm_45_base:
+    model_key: glm_4_5_base
+    path: "/data/maximilian.idahl/models/GLM-4.5-Base"
+    display_name: "GLM 4.5"
+    tokens_trained: 22T

@@ -1,4 +1,5 @@
 import argparse
+import json
 import subprocess
 from pathlib import Path
 
@@ -20,19 +21,23 @@ def run(args: argparse.Namespace) -> int:
     """Cancel all active SLURM jobs for a run."""
     config = load_config(args.run_dir / "eh_config.yaml")
 
+    manifest_path = args.run_dir / "eh_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    run_task_keys = set(manifest.keys())
+
     try:
         active = get_active_jobs(config.job_name)
     except Exception as e:
         logger.error(f"Error checking SLURM queue: {e}")
         return 1
 
-    job_ids = [str(j["job_id"]) for j in active if j.get("job_id")]
+    job_ids = [str(j["job_id"]) for j in active if j.get("job_id") and j.get("task_key") in run_task_keys]
 
     if not job_ids:
-        logger.info(f"No active jobs found for {config.job_name}.")
+        logger.info(f"No active jobs found for this run.")
         return 0
 
-    logger.info(f"Found {len(job_ids)} active job(s) for {config.job_name}")
+    logger.info(f"Found {len(job_ids)} active job(s) for eval")
 
     batch_size = 100
     for start in range(0, len(job_ids), batch_size):

@@ -260,16 +260,16 @@ class EhConfig(BaseModel):
         default=1,
         ge=1,
         description=(
-            "Max concurrent lm-eval processes per job (one per task). "
-            "1 = sequential (current behavior)."
+            "Max concurrent lm-eval processes per job (one per task)."
         ),
     )
-    task_batch_size: int = Field(
+    task_batch_size: Optional[int] = Field(
         default=8,
         ge=1,
         description=(
-            "Number of tasks per lm-eval invocation in parallel mode. "
-            "Larger values reduce filesystem I/O but lose more progress on failure."
+            "Number of tasks per lm-eval invocation. "
+            "Larger values reduce filesystem I/O but lose more progress on failure. "
+            "Set to null/None to use the sequential (per-suite) code path with no batching."
         ),
     )
 
@@ -407,11 +407,10 @@ class EhConfig(BaseModel):
 
         reserved_args = {
             "job-name", "partition", "account", "qos", "array", "nodes",
-            "cpus-per-task", "mem", "gres", "time", "signal", "output", "error",
+            "cpus-per-task", "gres", "time", "signal", "output", "error",
             "dependency", "requeue", "no-requeue", "wait",
             "gpus", "gpus-per-node", "gpus-per-socket", "gpus-per-task",
             "gpu-bind", "gpu-freq",
-            "mem-per-cpu", "mem-per-gpu", "mem-bind",
             "cpus-per-gpu", "cores-per-socket", "sockets-per-node",
             "threads-per-core",
             "ntasks", "ntasks-per-node", "ntasks-per-core",

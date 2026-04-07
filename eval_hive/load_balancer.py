@@ -44,7 +44,8 @@ class BackendPool:
 
     async def start(self) -> None:
         connector = aiohttp.TCPConnector(limit_per_host=50, keepalive_timeout=30)
-        self._session = aiohttp.ClientSession(connector=connector)
+        # trust_env=False: never use HTTP_PROXY / HTTPS_PROXY for local backend traffic
+        self._session = aiohttp.ClientSession(connector=connector, trust_env=False)
         self._health_task = asyncio.create_task(self._periodic_health_check())
 
     async def stop(self) -> None:

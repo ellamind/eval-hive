@@ -23,5 +23,6 @@ hf-transfer = ">=0.1, <1"
 polars = ">=1.0, <2"
 huggingface-hub = ">=1.3, <2"
 sentencepiece = ">=0.2, <1"
-lm-eval = {git = "https://github.com/EleutherAI/lm-evaluation-harness", branch = "main", extras = ["api", "math", "multilingual"]}
+lm-eval = {git = "https://github.com/EleutherAI/lm-evaluation-harness", branch = "main", extras = ["api", "math", "multilingual", "sentencepiece"]}
 duckdb = ">=1.4.4, <2"
+protobuf = ">=7.34.1, <8"

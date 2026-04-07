@@ -211,13 +211,15 @@ def run(args: argparse.Namespace) -> int:
         if state == "failed":
             fail_str = failed[task_key]["reason"]
 
-        progress_str = f"{local} / {hf_only} / {total}"
+        pct = ((local + hf_only) / total * 100) if total else 0
+        progress_str = f"{local} / {hf_only} / {total}  ({pct:.0f}%)"
         rows.append([task_key, state, progress_str, slurm_str or fail_str])
 
         if args.detailed:
             for suite in suites_and_tasks:
                 s_done, s_total = suite_progress.get(suite, (0, 0))
-                rows.append(["  \u2514 " + suite, "", f"{s_done} / {s_total}", ""])
+                s_pct = (s_done / s_total * 100) if s_total else 0
+                rows.append(["  \u2514 " + suite, "", f"{s_done} / {s_total}  ({s_pct:.0f}%)", ""])
 
     print(tabulate(
         rows,
