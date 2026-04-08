@@ -10,6 +10,7 @@ duckdb-cli = ">=1.4.4,<2"
 
 [tasks]
 eval-hive = "python -m eval_hive"
+auto-eval = { cmd = "python scripts/run_eval.py", description = "Run eval loop: pixi run auto-eval <run_dir> <config> [--interval N]" }
 
 [pypi-dependencies]
 pydantic = ">=2.12.5, <3"
