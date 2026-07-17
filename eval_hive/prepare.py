@@ -133,17 +133,21 @@ def resolve_task_names(tm, names):
 
 
 def get_task_dataset(tm, task_name):
-    """Read dataset_path from a task's YAML config without instantiating the task."""
+    """Read the dataset repo/config key without instantiating the task."""
     entry = tm.task_index.get(task_name)
     if entry is None:
         return "__unknown__"
     # Try cfg first (already parsed), fall back to loading YAML
     if entry.cfg:
-        return entry.cfg.get("dataset_path", "__unknown__")
-    if entry.yaml_path:
+        config = entry.cfg
+    elif entry.yaml_path:
         config = _load_yaml(entry.yaml_path)
-        return config.get("dataset_path", "__unknown__")
-    return "__unknown__"
+    else:
+        return "__unknown__"
+
+    dataset_path = config.get("dataset_path", "__unknown__")
+    dataset_name = config.get("dataset_name")
+    return f"{dataset_path}::{dataset_name}" if dataset_name else dataset_path
 
 
 def shard_tasks(tm, task_names, num_workers):
