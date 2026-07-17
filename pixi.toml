@@ -7,6 +7,7 @@ version = "0.1.0"
 [dependencies]
 python = ">=3.12,<3.14"
 duckdb-cli = ">=1.4.4,<2"
+jq = ">=1.7,<2"
 
 [tasks]
 eval-hive = "python -m eval_hive"
