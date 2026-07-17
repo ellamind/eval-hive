@@ -12,7 +12,80 @@ from pathlib import Path
 from loguru import logger
 from tqdm import tqdm
 
-from eval_hive.config import load_config
+from eval_hive.config import EhConfig, load_config
+
+
+def _resolve_prepare_metadata(config: EhConfig) -> dict:
+    """Build a metadata dict to pass to TaskManager during prepare.
+
+    Parses lm_eval_args['metadata'] (JSON string → dict) and injects a
+    tokenizer path so RULER-style tasks can generate their synthetic data.
+    The metadata is forwarded to every task's config via TaskManager(metadata=…),
+    which merges it into ``task.config.metadata`` before ``custom_dataset`` is called.
+    """
+    raw = config.eval.lm_eval_args.get("metadata")
+    if raw is None:
+        metadata: dict = {}
+    elif isinstance(raw, str):
+        try:
+            metadata = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "eval.lm_eval_args.metadata must be a valid JSON object"
+            ) from exc
+    else:
+        try:
+            metadata = dict(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "eval.lm_eval_args.metadata must be a mapping or JSON object"
+            ) from exc
+
+    if not isinstance(metadata, dict):
+        raise ValueError("eval.lm_eval_args.metadata must be a JSON object")
+
+    if "tokenizer" not in metadata and "pretrained" not in metadata:
+        tok_path = _resolve_tokenizer_path(config)
+        if tok_path:
+            metadata["tokenizer"] = tok_path
+        else:
+            logger.warning(
+                "Could not resolve a tokenizer path for prepare. "
+                "Tasks that generate synthetic data (e.g. RULER) may fail. "
+                "Set 'prepare_tokenizer' in your config to fix this."
+            )
+
+    return metadata or {}
+
+
+def _resolve_tokenizer_path(config: EhConfig) -> str | None:
+    """Return a concrete tokenizer path for the prepare step.
+
+    Priority:
+    1. config.prepare_tokenizer (explicit override)
+    2. config.eval.model_args['tokenizer'] / ['pretrained'] if no runtime placeholder
+    3. First resolved model path from config.models
+    """
+    if config.prepare_tokenizer:
+        return config.prepare_tokenizer
+
+    for key in ("tokenizer", "pretrained", "model"):
+        raw = config.eval.model_args.get(key)
+        if raw and "${" not in str(raw):
+            return str(raw)
+
+    for _model_key, entry in config.models.items():
+        try:
+            paths = entry.resolve_model_paths()
+            if paths:
+                _label, _step, path = paths[0]
+                return str(path)
+        except Exception:
+            base = Path(entry.path)
+            if base.exists():
+                return str(base)
+
+    return None
 
 
 def _load_yaml(path):
@@ -74,11 +147,20 @@ def get_task_dataset(tm, task_name):
 
 
 def shard_tasks(tm, task_names, num_workers):
-    """Group tasks by dataset_path, then bin-pack groups into num_workers shards."""
+    """Group tasks by dataset_path, then bin-pack groups into num_workers shards.
+
+    Tasks with an empty dataset_path use custom_dataset (local data generation,
+    e.g. RULER) and have no shared HuggingFace resource to protect, so each is
+    treated as its own independent group and can run on separate workers.
+    """
     # Group by dataset
     dataset_groups = defaultdict(list)
     for name in task_names:
         ds = get_task_dataset(tm, name)
+        # Empty dataset_path → custom_dataset task; make each task its own group
+        # so workers aren't serialised behind a single shared-dataset key.
+        if not ds:
+            ds = f"__custom__{name}"
         dataset_groups[ds].append(name)
 
     # Greedy bin-packing: largest groups first, assign to lightest worker
@@ -134,7 +216,8 @@ def worker_fn(args):
     datasets.logging.set_verbosity_warning()
     datasets.disable_progress_bar()
 
-    tm = TaskManager(include_path=eval_suite_path)
+    prepare_metadata = chat_args.get("prepare_metadata") or None
+    tm = TaskManager(include_path=eval_suite_path, metadata=prepare_metadata)
     results = {}
 
     for task_name in shard:
@@ -189,7 +272,8 @@ def run_sequential(config, all_task_names, refresh, chat_args):
     """Load tasks and build caches sequentially (--workers=1 path)."""
     from lm_eval.tasks import TaskManager
 
-    tm = TaskManager(include_path=config.eval.eval_suite_path)
+    prepare_metadata = chat_args.get("prepare_metadata") or None
+    tm = TaskManager(include_path=config.eval.eval_suite_path, metadata=prepare_metadata)
     tasks = []
 
     t0 = time.monotonic()
@@ -372,9 +456,15 @@ def run(args: argparse.Namespace) -> int:
 
     logger.info(f"Total: {len(all_task_names)} task(s)")
 
-    # 2. Build chat template args (shared across workers)
+    # 2. Build prepare metadata (passed to TaskManager so synthetic-data tasks get
+    #    tokenizer + max_seq_lengths; e.g. RULER) and chat template args.
+    prepare_metadata = _resolve_prepare_metadata(config)
+    if prepare_metadata:
+        tok = prepare_metadata.get("tokenizer") or prepare_metadata.get("pretrained")
+        logger.info(f"Prepare metadata: tokenizer={tok!r}, keys={sorted(prepare_metadata)}")
+
     apply_chat_template = bool(config.eval.lm_eval_args.get("apply_chat_template", False))
-    chat_args = {}
+    chat_args: dict = {"prepare_metadata": prepare_metadata}
     if apply_chat_template:
         # Collect unique tokenizer paths
         tokenizer_paths = []
@@ -385,11 +475,11 @@ def run(args: argparse.Namespace) -> int:
                 if tok_path not in seen_tok:
                     seen_tok.add(tok_path)
                     tokenizer_paths.append(tok_path)
-        chat_args = {
+        chat_args.update({
             "tokenizer_paths": tokenizer_paths,
             "system_instruction": config.eval.lm_eval_args.get("system_instruction"),
             "fewshot_as_multiturn": bool(config.eval.lm_eval_args.get("fewshot_as_multiturn", False)),
-        }
+        })
 
     # 3. Resolve effective cache dir and count existing files
     if config.request_cache_dir:

@@ -63,6 +63,8 @@ inference_server_command: >-
 # make sure it is reasonable for loading the model. larger models will take longer.
 health_check_max_wait_minutes: 10  # Maximum time to wait for API server to become healthy.
 health_check_interval_seconds: 20  # Interval between health check attempts
+# Relaunch the inference server after transient startup failures before failing the job.
+server_start_max_attempts: 3
 
 # === Eval Configuration ===
 eval:
@@ -90,6 +92,9 @@ eval:
 # === Output Configuration ===
 output_path: ""
 request_cache_dir: "lm_eval_requests_cache"  # optional: shared request cache for lm-eval (LM_HARNESS_CACHE_PATH)
+# Optional tokenizer used while preparing synthetic datasets such as RULER.
+# Defaults to eval.model_args.tokenizer/pretrained or the first resolved model path.
+# prepare_tokenizer: "/path/to/tokenizer"
 
 # === HuggingFace Results ===
 # Optional: HF dataset repo for result storage (e.g. 'org/eval-scores').

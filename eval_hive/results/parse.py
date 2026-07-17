@@ -22,6 +22,12 @@ _LANG_PREFIXES: list[tuple[str, str]] = [
 _DEFAULT_LANG = "eng"  # unprefixed tasks are English
 
 
+def _is_unevaluated_ruler_metric(metric_key: str, value: object) -> bool:
+    """Return whether *metric_key* is a RULER context-length sentinel."""
+    metric_name = metric_key.split(",", 1)[0]
+    return value == -1 and metric_name.isdigit()
+
+
 def _detect_language(task_name: str) -> str:
     for prefix, lang in _LANG_PREFIXES:
         if task_name.startswith(prefix):
@@ -245,6 +251,8 @@ def parse_result_file(
                 continue  # stderr is paired with its primary metric below
             if "," not in metric_key:
                 continue  # metadata keys like "name", "sample_len"
+            if _is_unevaluated_ruler_metric(metric_key, value):
+                continue  # RULER per-length sentinel for "not evaluated"
 
             metric_name, metric_filter = metric_key.split(",", 1)
 

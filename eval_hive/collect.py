@@ -125,6 +125,16 @@ def collect_from_run(
     discovered = discover_results(output_path, manifest, hf_covered_keys)
     logger.info("Discovered {} result files", len(discovered))
 
+    # Build allowed-task set from eh_task_map.json (if present).
+    # This restricts collect to only the tasks this run was configured to evaluate,
+    # even if the result files contain results from other suites.
+    task_map_path = run_dir / "eh_task_map.json"
+    allowed_tasks: set[str] | None = None
+    if task_map_path.exists():
+        task_map = json.loads(task_map_path.read_text())
+        allowed_tasks = {t for tasks in task_map.values() for t in tasks}
+        logger.info("Task filter: {} allowed tasks from eh_task_map.json", len(allowed_tasks))
+
     # Parse results
     all_rows: list[dict] = []
     n_errors = 0
@@ -142,6 +152,8 @@ def collect_from_run(
                 train_batch_size=dr.train_batch_size,
                 tokens_trained=dr.tokens_trained,
             )
+            if allowed_tasks is not None:
+                rows = [r for r in rows if r.task in allowed_tasks]
             all_rows.extend(r.model_dump() for r in rows)
         except Exception:
             n_errors += 1
@@ -217,6 +229,30 @@ def collect_from_run(
     # Drop any stale aggregates that came through local_df (parsed from
     # lm-eval group_subtasks); we replace them with fresh ones.
     run_combined = run_combined.filter(pl.col("task_type") == "benchmark")
+
+    # Which aggregate task names are being freshly computed for this run?
+    # Only evict those from HF — preserve aggregate rows produced by other
+    # configs (e.g. a standard-eval run for the same model).
+    fresh_agg_tasks: set[str] = (
+        set(agg_df["task"].unique().to_list()) if len(agg_df) > 0 else set()
+    )
+    if hf_df is not None and len(hf_df) > 0:
+        preserved_agg_filter = pl.col("model").is_in(run_models) & (
+            pl.col("task_type") != "benchmark"
+        )
+        if fresh_agg_tasks:
+            preserved_agg_filter = preserved_agg_filter & ~pl.col("task").is_in(
+                fresh_agg_tasks
+            )
+        hf_run_other_aggs = hf_df.filter(preserved_agg_filter)
+        if len(hf_run_other_aggs) > 0:
+            logger.info(
+                "Preserving {} HF aggregate rows for run models (from other configs)",
+                len(hf_run_other_aggs),
+            )
+            run_combined = pl.concat(
+                [run_combined, hf_run_other_aggs], how="diagonal_relaxed"
+            )
 
     if len(agg_df) > 0:
         run_combined = pl.concat([run_combined, agg_df], how="diagonal_relaxed")
@@ -299,19 +335,37 @@ def _log_diff_summary(old_df: pl.DataFrame | None, new_df: pl.DataFrame, label: 
     n_common = len(new_keys) - len(added)
 
     # For common rows, check if values actually changed
-    if n_common > 0 and "value" in old_df.columns and "value" in new_df.columns:
-        shared_cols = key_cols + ["value"]
+    if n_common > 0 and "score" in old_df.columns and "score" in new_df.columns:
+        shared_cols = key_cols + ["score"]
         old_shared = old_df.select(shared_cols).unique(subset=key_cols, keep="last")
         new_shared = new_df.select(shared_cols).unique(subset=key_cols, keep="last")
         matched = old_shared.join(new_shared, on=key_cols, how="inner", suffix="_new")
-        n_updated = matched.filter(pl.col("value") != pl.col("value_new")).height
+        n_updated = matched.filter(
+            pl.col("score").ne_missing(pl.col("score_new"))
+        ).height
     else:
         n_updated = 0
 
-    logger.info(
-        "{}: {} total → {} total | +{} added, ~{} updated, -{} removed",
-        label, len(old_df), len(new_df), len(added), n_updated, len(removed),
-    )
+    net = len(new_df) - len(old_df)
+    net_str = f"+{net}" if net >= 0 else str(net)
+
+    # Distinguish key-churn (same data, key column changed → shows as remove+add)
+    # from genuine additions / removals.
+    churned = min(len(added), len(removed))
+    genuine_added = len(added) - churned
+    genuine_removed = len(removed) - churned
+
+    parts = [f"net {net_str}"]
+    if churned:
+        parts.append(f"~{churned} keys replaced")
+    if genuine_added:
+        parts.append(f"+{genuine_added} new")
+    if genuine_removed:
+        parts.append(f"-{genuine_removed} dropped")
+    if n_updated:
+        parts.append(f"~{n_updated} values changed")
+
+    logger.info("{}: {} → {} rows | {}", label, len(old_df), len(new_df), ", ".join(parts))
 
 
 def _resolve_task_dirs(config) -> list[Path]:

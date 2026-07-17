@@ -1,6 +1,7 @@
 import argparse
 import json
 import re
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -378,7 +379,7 @@ def build_lm_eval_extra_args(config: EhConfig) -> str:
         if value is True:
             parts.append(f"--{key}")
         elif value is not False and value is not None:
-            parts.append(f"--{key} {value}")
+            parts.append(f"--{key} {shlex.quote(str(value))}")
 
     # Auto-enable request caching when a cache dir is configured
     if config.request_cache_dir and "cache_requests" not in config.eval.lm_eval_args:
@@ -393,9 +394,16 @@ def build_suites_bash_array(config: EhConfig) -> str:
 
 
 def clean_server_command(cmd: str) -> str:
-    """Remove YAML folded block scalar artifacts (backslash + whitespace)."""
+    """Remove YAML folded block scalar artifacts (backslash + whitespace).
+
+    Also escapes double quotes so the command can be safely embedded in a
+    bash double-quoted string (SERVER_COMMAND="...").  Single-quoted shell
+    arguments such as '--flag \'{"key": val}\'' survive this transformation
+    and are parsed correctly by the inner `bash -c "$SERVER_COMMAND"` call.
+    """
     cmd = re.sub(r'\\\s+', ' ', cmd)
     cmd = ' '.join(cmd.split())
+    cmd = cmd.replace('"', '\\"')
     return cmd
 
 
@@ -410,6 +418,7 @@ SBATCH_TEMPLATE = r"""#!/bin/bash
 #SBATCH --cpus-per-task={cpus_per_node}
 #SBATCH --gres={gres_per_node}
 #SBATCH --time={time_limit}
+#SBATCH --no-requeue
 #SBATCH --signal=B:SIGUSR1@120
 #SBATCH --output={log_dir}/%x-%j.log
 #SBATCH --error={log_dir}/%x-%j.log
@@ -584,66 +593,22 @@ exit $EVAL_FAILURES
 # ── Server lifecycle sub-templates ────────────────────────────
 
 SERVER_LIFECYCLE_BLOCK = r"""
-INFERENCE_SERVER_LOG="{log_dir}/${{SLURM_JOB_NAME}}-${{SLURM_JOB_ID}}-inference-server.log"
+INFERENCE_SERVER_LOG_BASE="{log_dir}/${{SLURM_JOB_NAME}}-${{SLURM_JOB_ID}}-inference-server"
 SERVER_COMMAND="{inference_server_command}"
+SERVER_START_MAX_ATTEMPTS={server_start_max_attempts}
 SERVER_PID=""
-log "INFO" "Starting inference server"
-log "INFO" "Command: ${{SERVER_COMMAND}}"
 # Unset conflicting SLURM memory variables (they are mutually exclusive and
 # srun inherits all of them from the job environment, causing a fatal error).
 unset SLURM_MEM_PER_CPU SLURM_MEM_PER_GPU SLURM_MEM_PER_NODE
 
-setsid --wait srun --cpu-bind=none \
-    --output="$INFERENCE_SERVER_LOG" --error="$INFERENCE_SERVER_LOG" \
-    --export=ALL,NO_COLOR=1 \
-    bash -c "${{SERVER_COMMAND}}" &
-SERVER_PID=$!
-
-sleep 5
-
-# Check if srun started successfully
-if ! kill -0 $SERVER_PID 2>/dev/null; then
-    wait $SERVER_PID
-    SERVER_EXIT=$?
-    log "ERROR" "Inference server failed to start (exit code $SERVER_EXIT)"
-    log_failed "server_startup_failed" "exit code $SERVER_EXIT"
-    exit 1
-fi
-
-# Health check
-wait_for_server() {{
-    local max_attempts=$(({health_check_max_wait_minutes} * 60 / {health_check_interval_seconds}))
-    log "INFO" "Max health check wait: {health_check_max_wait_minutes} minutes"
-    local attempt=0
-    local health_url="http://localhost:${{EH_PORT}}/health"
-
-    while [ $attempt -lt $max_attempts ]; do
-        if ! kill -0 $SERVER_PID 2>/dev/null; then
-            log "ERROR" "Server process died during health checks"
-            wait $SERVER_PID 2>/dev/null
-            log_failed "server_died_during_healthcheck" "PID $SERVER_PID terminated"
-            return 1
-        fi
-        local hc_status
-        hc_status="$(curl --noproxy '*' -s -o /dev/null -w '%{{http_code}}' --connect-timeout 5 --max-time 10 "$health_url")" || true
-        if [ "$hc_status" = "200" ]; then
-            log "INFO" "Inference server is healthy!"
-            return 0
-        fi
-        log "INFO" "Not ready (HTTP $hc_status), waiting {health_check_interval_seconds}s... ($((attempt + 1))/${{max_attempts}})"
-        sleep {health_check_interval_seconds}
-        attempt=$((attempt + 1))
-    done
-    log "ERROR" "Server did not become healthy within timeout"
-    return 1
+# Forcefully tear down any inference server process/children left over from a
+# failed attempt so a retry starts from a clean slate.
+kill_server() {{
+    if [ -n "$SERVER_PID" ] && kill -0 $SERVER_PID 2>/dev/null; then
+        kill -KILL -$SERVER_PID 2>/dev/null || kill -KILL $SERVER_PID 2>/dev/null
+        wait $SERVER_PID 2>/dev/null || true
+    fi
 }}
-
-wait_for_server
-if [ $? -ne 0 ]; then
-    log "ERROR" "Health check failed. Exiting."
-    log_failed "health_check_failed" "Server not healthy within timeout"
-    exit 1
-fi
 
 shutdown_servers() {{
     if [ -n "$SERVER_PID" ] && kill -0 $SERVER_PID 2>/dev/null; then
@@ -663,11 +628,94 @@ shutdown_servers() {{
             kill -KILL -$SERVER_PID 2>/dev/null || kill -KILL $SERVER_PID 2>/dev/null
         fi
     fi
-    # Kill any remaining vllm/singularity processes that survived signal-based shutdown
-    # (e.g. container processes started via setsid srun that ignore parent signals)
-    pkill -KILL -f "vllm serve.*${{EH_PORT}}" 2>/dev/null || true
-    pkill -KILL -f "singularity exec.*${{EH_PORT}}" 2>/dev/null || true
 }}
+# Defined upfront (rather than only after startup succeeds) so that a
+# SIGTERM/SIGUSR1 arriving mid-retry can still clean up a spawned srun step.
+
+launch_server() {{
+    local attempt_log="$1"
+    log "INFO" "Starting inference server (log: $attempt_log)"
+    log "INFO" "Command: ${{SERVER_COMMAND}}"
+
+    setsid --wait srun --cpu-bind=none \
+        --output="$attempt_log" --error="$attempt_log" \
+        --export=ALL,NO_COLOR=1 \
+        bash -c "${{SERVER_COMMAND}}" &
+    SERVER_PID=$!
+
+    sleep 5
+
+    # Check if srun started successfully
+    if ! kill -0 $SERVER_PID 2>/dev/null; then
+        wait $SERVER_PID
+        local server_exit=$?
+        log "ERROR" "Inference server failed to start (exit code $server_exit)"
+        return 1
+    fi
+    return 0
+}}
+
+# Health check
+wait_for_server() {{
+    local max_attempts=$(({health_check_max_wait_minutes} * 60 / {health_check_interval_seconds}))
+    log "INFO" "Max health check wait: {health_check_max_wait_minutes} minutes"
+    local attempt=0
+    local health_url="http://localhost:${{EH_PORT}}/health"
+
+    while [ $attempt -lt $max_attempts ]; do
+        if ! kill -0 $SERVER_PID 2>/dev/null; then
+            log "ERROR" "Server process died during health checks"
+            wait $SERVER_PID 2>/dev/null
+            return 1
+        fi
+        local hc_status
+        hc_status="$(curl --noproxy '*' -s -o /dev/null -w '%{{http_code}}' --connect-timeout 5 --max-time 10 "$health_url")" || true
+        if [ "$hc_status" = "200" ]; then
+            log "INFO" "Inference server is healthy!"
+            return 0
+        fi
+        log "INFO" "Not ready (HTTP $hc_status), waiting {health_check_interval_seconds}s... ($((attempt + 1))/${{max_attempts}})"
+        sleep {health_check_interval_seconds}
+        attempt=$((attempt + 1))
+    done
+    log "ERROR" "Server did not become healthy within timeout"
+    return 1
+}}
+
+# ── Start (with retries) ────────────────────────────────────────
+# Transient startup crashes (e.g. multiprocessing races during vLLM worker
+# spawn) are common enough that a blind retry is worthwhile before giving up
+# on the whole SLURM job.
+SERVER_READY=0
+for start_attempt in $(seq 1 $SERVER_START_MAX_ATTEMPTS); do
+    if [ "$SERVER_START_MAX_ATTEMPTS" -gt 1 ]; then
+        ATTEMPT_LOG="${{INFERENCE_SERVER_LOG_BASE}}-attempt${{start_attempt}}.log"
+    else
+        ATTEMPT_LOG="${{INFERENCE_SERVER_LOG_BASE}}.log"
+    fi
+
+    if [ $start_attempt -gt 1 ]; then
+        log "WARN" "Retrying inference server startup (attempt $start_attempt/$SERVER_START_MAX_ATTEMPTS)"
+        kill_server
+        sleep 10
+    fi
+
+    if ! launch_server "$ATTEMPT_LOG"; then
+        continue
+    fi
+
+    if wait_for_server; then
+        SERVER_READY=1
+        break
+    fi
+    kill_server
+done
+
+if [ $SERVER_READY -ne 1 ]; then
+    log "ERROR" "Inference server did not become healthy after $SERVER_START_MAX_ATTEMPTS attempt(s). Exiting."
+    log_failed "health_check_failed" "Server not healthy after $SERVER_START_MAX_ATTEMPTS attempt(s)"
+    exit 1
+fi
 """
 
 SERVER_LIFECYCLE_BLOCK_SERVERLESS = r"""
@@ -1298,6 +1346,7 @@ def run(args: argparse.Namespace) -> int:
                 inference_server_command=server_cmd,
                 health_check_max_wait_minutes=config.health_check_max_wait_minutes,
                 health_check_interval_seconds=config.health_check_interval_seconds,
+                server_start_max_attempts=config.server_start_max_attempts,
             )
             server_shutdown_block = SERVER_SHUTDOWN_BLOCK
     else:

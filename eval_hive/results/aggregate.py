@@ -332,12 +332,14 @@ def aggregate_scores(
                 # Use latest eval_date from children
                 eval_date = max(child_eval_dates) if child_eval_dates else None
 
-                # Derive tokens_trained: prefer batch_size * step, fall back to child propagation
+                # Derive tokens_trained: prefer explicit child value (covers cases where
+                # tokens_trained was set directly, e.g. multi-stage training with a changed
+                # batch size), fall back to batch_size * step only when not set.
                 tokens_trained = None
-                if child_train_batch_size is not None and step_val is not None:
-                    tokens_trained = child_train_batch_size * step_val
-                elif child_tokens_trained is not None:
+                if child_tokens_trained is not None:
                     tokens_trained = child_tokens_trained
+                elif child_train_batch_size is not None and step_val is not None:
+                    tokens_trained = child_train_batch_size * step_val
 
                 row_dict = {
                     "model": model,

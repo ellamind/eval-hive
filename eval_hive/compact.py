@@ -29,8 +29,19 @@ _MERGE_KEYS = (
     "task_hashes",
 )
 
+# Keys whose values are {task: {sub_key: ...}} where sub_key sets may differ
+# between source files (e.g. RULER context-length metrics from a split config).
+# These need two-level merge; the others can use a shallow update.
+_DEEP_MERGE_KEYS = ("results", "higher_is_better")
+
 # Matches batch directories created by the parallel eval loop: batch_{job_id}_{idx}
 _BATCH_DIR_RE = re.compile(r"^batch_(\d+)_\d+$")
+
+
+def _is_unevaluated_ruler_metric(key: str, value: object) -> bool:
+    """Return whether *key* is a RULER context-length sentinel metric."""
+    metric_name = key.split(",", 1)[0]
+    return value == -1 and metric_name.isdigit()
 
 
 def compact_checkpoint(
@@ -98,7 +109,23 @@ def compact_checkpoint(
             continue
 
         for key in _MERGE_KEYS:
-            merged.setdefault(key, {}).update(data.get(key, {}))
+            if key in _DEEP_MERGE_KEYS:
+                dst = merged.setdefault(key, {})
+                for tname, tdata in data.get(key, {}).items():
+                    if isinstance(tdata, dict):
+                        inner = dst.setdefault(tname, {})
+                        for k, v in tdata.items():
+                            # lm-eval RULER emits -1 for context lengths a run
+                            # did not evaluate. Only apply this rule to result
+                            # metric keys so legitimate negative scores and
+                            # metadata values are retained.
+                            if key == "results" and _is_unevaluated_ruler_metric(k, v):
+                                continue
+                            inner[k] = v
+                    else:
+                        dst[tname] = tdata
+            else:
+                merged.setdefault(key, {}).update(data.get(key, {}))
 
         # File-level metadata: overwrite with each newer file.
         for key, value in data.items():

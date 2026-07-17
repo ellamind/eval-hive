@@ -305,6 +305,16 @@ class EhConfig(BaseModel):
     health_check_interval_seconds: int = Field(
         default=20, gt=0, description="Interval between health checks in seconds"
     )
+    server_start_max_attempts: int = Field(
+        default=3,
+        gt=0,
+        description=(
+            "Number of times to attempt starting the inference server (relaunching "
+            "it from scratch) before marking the task as failed. Guards against "
+            "transient startup crashes (e.g. multiprocessing races during vLLM "
+            "worker spawn) without burning a full SLURM job/queue cycle per retry."
+        ),
+    )
 
     # Eval Configuration
     eval: EvalSection
@@ -314,6 +324,16 @@ class EhConfig(BaseModel):
     request_cache_dir: Optional[Path] = Field(
         default=None,
         description="Directory for lm-eval request cache (overrides LM_HARNESS_CACHE_PATH). If not set, lm-eval uses its built-in default.",
+    )
+
+    # Prepare-time tokenizer (used by tasks that generate synthetic data, e.g. RULER)
+    prepare_tokenizer: Optional[str] = Field(
+        default=None,
+        description=(
+            "Tokenizer path for tasks that generate synthetic data during 'prepare' "
+            "(e.g. RULER). If not set, eval-hive auto-detects from the first resolved "
+            "model path. Set explicitly when model checkpoints are not yet on disk."
+        ),
     )
 
     # HuggingFace Results

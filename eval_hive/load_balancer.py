@@ -27,6 +27,8 @@ logger = logging.getLogger("eval_hive.load_balancer")
 FAILURE_THRESHOLD = 10
 # How often (seconds) to health-check backends and potentially restore them
 HEALTH_CHECK_INTERVAL = 60
+# aiohttp defaults to 1 MiB, which is too small for long-context requests.
+DEFAULT_MAX_REQUEST_SIZE_MB = 1024
 
 
 class BackendPool:
@@ -195,9 +197,12 @@ async def _proxy_handler(request: web.Request) -> web.StreamResponse:
     return await pool.forward(request)
 
 
-def create_app(backends: list[str]) -> web.Application:
+def create_app(
+    backends: list[str],
+    max_request_size_mb: int = DEFAULT_MAX_REQUEST_SIZE_MB,
+) -> web.Application:
     pool = BackendPool(backends)
-    app = web.Application()
+    app = web.Application(client_max_size=max_request_size_mb * 1024 * 1024)
     app["pool"] = pool
     app.router.add_get("/health", _health_handler)
     app.router.add_route("*", "/{path_info:.*}", _proxy_handler)
@@ -216,7 +221,18 @@ def main() -> None:
         help="Comma-separated host:port list",
     )
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--max-request-size-mb",
+        type=int,
+        default=DEFAULT_MAX_REQUEST_SIZE_MB,
+        help=(
+            "Maximum accepted request body size in MiB "
+            f"(default: {DEFAULT_MAX_REQUEST_SIZE_MB})"
+        ),
+    )
     args = parser.parse_args()
+    if args.max_request_size_mb <= 0:
+        parser.error("--max-request-size-mb must be greater than zero")
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
@@ -225,7 +241,7 @@ def main() -> None:
     backends = [b.strip() for b in args.backends.split(",")]
     logger.info("Starting load balancer on :%d -> %s", args.listen_port, backends)
 
-    app = create_app(backends)
+    app = create_app(backends, max_request_size_mb=args.max_request_size_mb)
     web.run_app(
         app,
         host="0.0.0.0",
