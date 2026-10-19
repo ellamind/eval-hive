@@ -28,3 +28,7 @@ sentencepiece = ">=0.2, <1"
 lm-eval = {git = "https://github.com/EleutherAI/lm-evaluation-harness", branch = "main", extras = ["api", "math", "multilingual", "sentencepiece", "ruler"]}
 duckdb = ">=1.4.4, <2"
 protobuf = ">=7.34.1, <8"
+# filelock >=3.16 adds an at-fork audit that raises "os.fork is unsafe while
+# filelock is changing descriptor ownership" when evaluate's code_eval forks to
+# sandbox generated code (HumanEval/MBPP/LBPP). Pin below it so code tasks work.
+filelock = "<3.16"

@@ -1089,7 +1089,18 @@ run_task_batch() {{
     mkdir -p "$BATCH_DIR"
     log "INFO" "[batch $BATCH_IDX] Starting evaluation: $TASKS_CSV"
 
-    lm_eval run \
+    # Isolate HF `evaluate`'s metrics cache per batch. code_eval (and other
+    # evaluate metrics) write a cache file named only by experiment_id —
+    # $HF_METRICS_CACHE/code_eval/default/default_experiment-1-0.arrow — and
+    # HF_METRICS_CACHE defaults to $HF_HOME/metrics, usually on shared storage.
+    # Concurrent batches (and jobs sharing HF_HOME) then race on that single
+    # file: one finishes and os.remove()s it, the next crashes with
+    # FileNotFoundError, failing the whole batch. A per-batch node-local dir
+    # keeps them separate.
+    local EH_METRICS_CACHE="${{TMPDIR:-/tmp}}/eh_metrics_${{SLURM_JOB_ID}}_$(printf '%03d' $BATCH_IDX)"
+    mkdir -p "$EH_METRICS_CACHE"
+
+    HF_METRICS_CACHE="$EH_METRICS_CACHE" lm_eval run \
         {lm_eval_extra_args} \
         --model_args "{model_args_string}" \
         --tasks "$TASKS_CSV" \
