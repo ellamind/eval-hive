@@ -212,6 +212,13 @@ def aggregate_scores(
         if key not in task_metric_filter or mfilter == "none":
             task_metric_filter[key] = mfilter
 
+    # Tasks with at least one score row per (model, step).  A child with no
+    # rows at all has not been evaluated yet, so its applicability cannot be
+    # inferred from the data and aggregating without it would be partial.
+    tasks_scored: dict[tuple, set[str]] = {}
+    for model, step_val, tname, _, _ in scores:
+        tasks_scored.setdefault((model, step_val), set()).add(tname)
+
     suite_set = set(suites)
     aggregate_rows: list[dict] = []
 
@@ -231,7 +238,24 @@ def aggregate_scores(
                 parent_task = other_name
                 break
 
+        # Child groups without an aggregate_metric_list never produce scores.
+        required_children = [
+            c for c in group.children
+            if c not in hierarchy or hierarchy[c].aggregate_metrics
+        ]
+
         for model, step_val in model_steps:
+            scored = tasks_scored.get((model, step_val), set())
+            unscored = [c for c in required_children if c not in scored]
+            if unscored:
+                logger.warning(
+                    "Skipping aggregate for %s (%s, step=%s): %d/%d children "
+                    "have no scores yet (e.g. %s)",
+                    group_name, model, step_val, len(unscored),
+                    len(required_children), ", ".join(unscored[:3]),
+                )
+                continue
+
             for agg_metric in group.aggregate_metrics:
                 metric_name = agg_metric.metric
 
@@ -372,6 +396,7 @@ def aggregate_scores(
                 # Store so parent groups can use this score
                 result_key = (model, step_val, group_name, metric_name, "none")
                 scores[result_key] = row_dict
+                tasks_scored.setdefault((model, step_val), set()).add(group_name)
 
                 aggregate_rows.append(row_dict)
 
