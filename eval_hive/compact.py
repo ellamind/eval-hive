@@ -67,13 +67,13 @@ def compact_checkpoint(
         return 0, 0
 
     # Already fully compacted — nothing to do.
-    if len(subdirs) == 1 and subdirs[0].name == "compacted":
+    if {d.name for d in subdirs} <= {"compacted", "lm_response_cache"}:
         return 0, 0
 
     # Partition subdirs into safe-to-compact and skipped (active jobs).
     safe_subdirs: list[Path] = []
     for subdir in subdirs:
-        if subdir.name == "compacted":
+        if subdir.name in ("compacted", "lm_response_cache"):
             continue
         m = _BATCH_DIR_RE.match(subdir.name)
         if m and m.group(1) in active_job_ids:

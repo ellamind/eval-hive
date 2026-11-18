@@ -373,6 +373,8 @@ def build_lm_eval_extra_args(config: EhConfig) -> str:
     Boolean true → bare flag (--log_samples).
     Other values → --key value.
     Automatically adds --cache_requests true when request_cache_dir is set.
+    Adds --use_cache (lm-eval response cache) unless lm_eval_args sets use_cache;
+    use_cache: false turns it off. The job script sets $EH_RESP_CACHE_DB per lm-eval call.
     """
     parts = []
     for key, value in config.eval.lm_eval_args.items():
@@ -384,6 +386,11 @@ def build_lm_eval_extra_args(config: EhConfig) -> str:
     # Auto-enable request caching when a cache dir is configured
     if config.request_cache_dir and "cache_requests" not in config.eval.lm_eval_args:
         parts.append("--cache_requests true")
+
+    # Response cache under the checkpoint's output dir, so a rerun after a timeout
+    # or failure reuses finished requests and the model outputs are kept.
+    if "use_cache" not in config.eval.lm_eval_args:
+        parts.append('--use_cache "$EH_RESP_CACHE_DB"')
 
     return " ".join(parts)
 
@@ -984,6 +991,8 @@ for SUITE in "${{EH_SUITES[@]}}"; do
 
     log "INFO" "[$SUITE] Starting evaluation"
     mkdir -p "$SUITE_OUTPUT_DIR"
+    EH_RESP_CACHE_DB="$EH_OUTPUT_BASE/lm_response_cache/$SUITE"
+    mkdir -p "$EH_OUTPUT_BASE/lm_response_cache"
 
     # --output_path with .json suffix prevents lm_eval from creating model subdirectories
     lm_eval run \
@@ -1088,6 +1097,11 @@ run_task_batch() {{
 
     mkdir -p "$BATCH_DIR"
     log "INFO" "[batch $BATCH_IDX] Starting evaluation: $TASKS_CSV"
+
+    # lm-eval response cache, keyed by the batch's task list so a rerun of the same
+    # tasks in a later job finds it; lm-eval appends _rank0.db.
+    local EH_RESP_CACHE_DB="$EH_OUTPUT_BASE/lm_response_cache/$(printf %s "$TASKS_CSV" | md5sum | cut -c1-16)"
+    mkdir -p "$EH_OUTPUT_BASE/lm_response_cache"
 
     lm_eval run \
         {lm_eval_extra_args} \
